@@ -317,6 +317,18 @@ static void smmuv3_init_regs(SMMUv3State *s)
     s->gerrorn = 0;
     s->statusr = 0;
     s->gbpa = SMMU_GBPA_RESET_VAL;
+
+    /* Initialize secure state */
+    memset(s->secure_idr, 0, sizeof(s->secure_idr));
+    /* Secure EL2 and Secure stage 2 support */
+    s->secure_idr[1] = FIELD_DP32(s->secure_idr[1], S_IDR1, SEL2, 1);
+    /* Secure state implemented */
+    s->secure_idr[1] = FIELD_DP32(s->secure_idr[1], S_IDR1,
+        SECURE_IMPL, 1);
+    s->secure_idr[1] = FIELD_DP32(s->secure_idr[1], S_IDR1,
+        S_SIDSIZE, SMMU_IDR1_SIDSIZE);
+
+    s->secure_gbpa = SMMU_GBPA_RESET_VAL;
 }
 
 static int smmu_get_ste(SMMUv3State *s, dma_addr_t addr, STE *buf,
@@ -1278,6 +1290,12 @@ static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage)
     }
 }
 
+/* Check if the SMMU hardware itself implements secure state features */
+static inline bool smmu_hw_secure_implemented(SMMUv3State *s)
+{
+    return FIELD_EX32(s->secure_idr[1], S_IDR1, SECURE_IMPL);
+}
+
 static int smmuv3_cmdq_consume(SMMUv3State *s)
 {
     SMMUState *bs = ARM_SMMU(s);
@@ -1508,9 +1526,91 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
     return 0;
 }
 
+/* Helper function for secure register write validation */
+static bool smmu_validate_secure_write(MemTxAttrs attrs, bool secure_impl,
+                                       hwaddr offset, const char *reg_name)
+{
+    if (!attrs.secure || !secure_impl) {
+        const char *reason = !attrs.secure ?
+            "Non-secure write attempt" :
+            "SMMU didn't implement Security State";
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: %s at offset 0x%" PRIx64 " (%s, WI)\n",
+                      __func__, reason, offset, reg_name);
+        return false;
+    }
+    return true;
+}
+
+/* Helper function for secure register read validation */
+static bool smmu_validate_secure_read(MemTxAttrs attrs, bool secure_impl,
+                                      hwaddr offset, const char *reg_name,
+                                      uint64_t *data)
+{
+    if (!attrs.secure || !secure_impl) {
+        const char *reason = !attrs.secure ?
+            "Non-secure read attempt" :
+            "SMMU didn't implement Security State";
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: %s at offset 0x%" PRIx64 " (%s, RAZ)\n",
+                      __func__, reason, offset, reg_name);
+        *data = 0; /* RAZ */
+        return false;
+    }
+    return true;
+}
+
+/* Macro for secure write validation - returns early if validation fails */
+#define SMMU_CHECK_SECURE_WRITE(reg_name) \
+    do { \
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset, \
+                                        reg_name)) { \
+            return MEMTX_OK; \
+        } \
+    } while (0)
+
+/* Macro for attrs.secure only validation */
+#define SMMU_CHECK_ATTRS_SECURE(reg_name) \
+    do { \
+        if (!attrs.secure) { \
+            qemu_log_mask(LOG_GUEST_ERROR, \
+                          "%s: Non-secure write attempt at offset " \
+                          "0x%" PRIx64 " (%s, WI)\n", \
+                          __func__, offset, reg_name); \
+            return MEMTX_OK; \
+        } \
+    } while (0)
+
+/* Macro for secure read validation - returns RAZ if validation fails */
+#define SMMU_CHECK_SECURE_READ(reg_name) \
+    do { \
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset, \
+                                       reg_name, data)) { \
+            return MEMTX_OK; \
+        } \
+    } while (0)
+
+/* Macro for attrs.secure only validation (read) */
+#define SMMU_CHECK_ATTRS_SECURE_READ(reg_name) \
+    do { \
+        if (!attrs.secure) { \
+            qemu_log_mask(LOG_GUEST_ERROR, \
+                          "%s: Non-secure read attempt at offset " \
+                          "0x%" PRIx64 " (%s, RAZ)\n", \
+                          __func__, offset, reg_name); \
+            *data = 0; \
+            return MEMTX_OK; \
+        } \
+    } while (0)
+
 static MemTxResult smmu_writell(SMMUv3State *s, hwaddr offset,
                                uint64_t data, MemTxAttrs attrs)
 {
+    bool secure_impl = false;
+    if (offset >= SMMU_SECURE_BASE_OFFSET) {
+        secure_impl = smmu_hw_secure_implemented(s);
+    }
+
     switch (offset) {
     case A_GERROR_IRQ_CFG0:
         s->gerror_irq_cfg0 = data;
@@ -1535,6 +1635,41 @@ static MemTxResult smmu_writell(SMMUv3State *s, hwaddr offset,
     case A_EVENTQ_IRQ_CFG0:
         s->eventq_irq_cfg0 = data;
         return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0:
+        /* No need to check secure_impl here */
+        SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG0");
+        s->secure_gerror_irq_cfg0 = data;
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE:
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset,
+                                        "S_STRTAB_BASE")) {
+            return MEMTX_OK;
+        }
+        s->secure_strtab_base = data;
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE:
+        SMMU_CHECK_SECURE_WRITE("S_CMDQ_BASE");
+        s->secure_cmdq.base = data;
+        s->secure_cmdq.log2size = extract64(s->secure_cmdq.base, 0, 5);
+        if (s->secure_cmdq.log2size > SMMU_CMDQS) {
+            s->secure_cmdq.log2size = SMMU_CMDQS;
+        }
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_BASE");
+        s->secure_eventq.base = data;
+        s->secure_eventq.log2size = extract64(s->secure_eventq.base, 0, 5);
+        if (s->secure_eventq.log2size > SMMU_EVENTQS) {
+            s->secure_eventq.log2size = SMMU_EVENTQS;
+        }
+        return MEMTX_OK;
+    case A_S_EVENTQ_IRQ_CFG0:
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset,
+                                        "S_EVENTQ_IRQ_CFG0")) {
+            return MEMTX_OK;
+        }
+        s->secure_eventq_irq_cfg0 = data;
+        return MEMTX_OK;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s Unexpected 64-bit access to 0x%"PRIx64" (WI)\n",
@@ -1546,6 +1681,11 @@ static MemTxResult smmu_writell(SMMUv3State *s, hwaddr offset,
 static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
                                uint64_t data, MemTxAttrs attrs)
 {
+    bool secure_impl = false;
+    if (offset >= SMMU_SECURE_BASE_OFFSET) {
+        secure_impl = smmu_hw_secure_implemented(s);
+    }
+
     switch (offset) {
     case A_CR0:
         s->cr[0] = data;
@@ -1650,6 +1790,137 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
     case A_EVENTQ_IRQ_CFG2:
         s->eventq_irq_cfg2 = data;
         return MEMTX_OK;
+    case A_S_CR0:
+        SMMU_CHECK_SECURE_WRITE("S_CR0");
+        s->secure_cr[0] = data;
+        /* clear reserved bits */
+        s->secure_cr0ack = data & ~SMMU_S_CR0_RESERVED;
+        smmuv3_cmdq_consume(s);
+        return MEMTX_OK;
+    case A_S_CR1:
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset,
+                                        "S_CR1")) {
+            return MEMTX_OK;
+        }
+        s->secure_cr[1] = data;
+        return MEMTX_OK;
+    case A_S_CR2:
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset,
+                                        "S_CR2")) {
+            return MEMTX_OK;
+        }
+        s->secure_cr[2] = data;
+        return MEMTX_OK;
+    case A_S_IRQ_CTRL:
+        if (!smmu_validate_secure_write(attrs, secure_impl, offset,
+                                        "S_IRQ_CTRL")) {
+            return MEMTX_OK;
+        }
+        s->secure_irq_ctrl = data;
+        return MEMTX_OK;
+    case A_S_GERRORN:
+        SMMU_CHECK_SECURE_WRITE("S_GERRORN");
+        smmuv3_write_gerrorn(s, data);
+        smmuv3_cmdq_consume(s);
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0:
+        SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG0");
+        s->secure_gerror_irq_cfg0 = data;
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0 + 4:
+        SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG0");
+        s->secure_gerror_irq_cfg0 = deposit64(s->secure_gerror_irq_cfg0,
+                                              32, 32, data);
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG1:
+        SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG1");
+        s->secure_gerror_irq_cfg1 = data;
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG2:
+        SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG2");
+        s->secure_gerror_irq_cfg2 = data;
+        return MEMTX_OK;
+    case A_S_GBPA:
+        SMMU_CHECK_SECURE_WRITE("S_GBPA");
+        if (data & R_S_GBPA_UPDATE_MASK) {
+            s->secure_gbpa = data & ~R_S_GBPA_UPDATE_MASK;
+        }
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE:
+        SMMU_CHECK_SECURE_WRITE("S_STRTAB_BASE");
+        s->secure_strtab_base = deposit64(s->secure_strtab_base, 0, 32, data);
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE + 4:
+        SMMU_CHECK_SECURE_WRITE("S_STRTAB_BASE");
+        s->secure_strtab_base = deposit64(s->secure_strtab_base, 32, 32, data);
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE_CFG:
+        SMMU_CHECK_SECURE_WRITE("S_STRTAB_BASE_CFG");
+        s->secure_strtab_base_cfg = data;
+        if (FIELD_EX32(data, S_STRTAB_BASE_CFG, FMT) == 1) {
+            s->secure_sid_split = FIELD_EX32(data, S_STRTAB_BASE_CFG, SPLIT);
+            s->secure_features |= SMMU_FEATURE_2LVL_STE;
+        }
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE:
+        SMMU_CHECK_SECURE_WRITE("S_CMDQ_BASE");
+        s->secure_cmdq.base = deposit64(s->secure_cmdq.base, 0, 32, data);
+        s->secure_cmdq.log2size = extract64(s->secure_cmdq.base, 0, 5);
+        if (s->secure_cmdq.log2size > SMMU_CMDQS) {
+            s->secure_cmdq.log2size = SMMU_CMDQS;
+        }
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE + 4:
+        SMMU_CHECK_SECURE_WRITE("S_CMDQ_BASE");
+        s->secure_cmdq.base = deposit64(s->secure_cmdq.base, 32, 32, data);
+        return MEMTX_OK;
+    case A_S_CMDQ_PROD:
+        SMMU_CHECK_SECURE_WRITE("S_CMDQ_PROD");
+        s->secure_cmdq.prod = data;
+        smmuv3_cmdq_consume(s);
+        return MEMTX_OK;
+    case A_S_CMDQ_CONS:
+        SMMU_CHECK_SECURE_WRITE("S_CMDQ_CONS");
+        s->secure_cmdq.cons = data;
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_BASE");
+        s->secure_eventq.base = deposit64(s->secure_eventq.base, 0, 32, data);
+        s->secure_eventq.log2size = extract64(s->secure_eventq.base, 0, 5);
+        if (s->secure_eventq.log2size > SMMU_EVENTQS) {
+            s->secure_eventq.log2size = SMMU_EVENTQS;
+        }
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE + 4:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_BASE");
+        s->secure_eventq.base = deposit64(s->secure_eventq.base, 32, 32, data);
+        return MEMTX_OK;
+    case A_S_EVENTQ_PROD:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_PROD");
+        s->secure_eventq.prod = data;
+        return MEMTX_OK;
+    case A_S_EVENTQ_CONS:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_CONS");
+        s->secure_eventq.cons = data;
+        return MEMTX_OK;
+    case A_S_EVENTQ_IRQ_CFG0:
+        SMMU_CHECK_SECURE_WRITE("S_EVENTQ_IRQ_CFG0");
+        s->secure_eventq_irq_cfg0 = deposit64(s->secure_eventq_irq_cfg0,
+                                              0, 32, data);
+        return MEMTX_OK;
+    case A_S_EVENTQ_IRQ_CFG0 + 4:
+        SMMU_CHECK_ATTRS_SECURE("S_EVENTQ_IRQ_CFG0");
+        s->secure_eventq_irq_cfg0 = deposit64(s->secure_eventq_irq_cfg0,
+                                              32, 32, data);
+        return MEMTX_OK;
+    case A_S_EVENTQ_IRQ_CFG1:
+        SMMU_CHECK_ATTRS_SECURE("S_EVENTQ_IRQ_CFG1");
+        s->secure_eventq_irq_cfg1 = data;
+        return MEMTX_OK;
+    case A_S_EVENTQ_IRQ_CFG2:
+        SMMU_CHECK_ATTRS_SECURE("S_EVENTQ_IRQ_CFG2");
+        s->secure_eventq_irq_cfg2 = data;
+        return MEMTX_OK;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s Unexpected 32-bit access to 0x%"PRIx64" (WI)\n",
@@ -1687,6 +1958,11 @@ static MemTxResult smmu_write_mmio(void *opaque, hwaddr offset, uint64_t data,
 static MemTxResult smmu_readll(SMMUv3State *s, hwaddr offset,
                                uint64_t *data, MemTxAttrs attrs)
 {
+    bool secure_impl = false;
+    if (offset >= SMMU_SECURE_BASE_OFFSET) {
+        secure_impl = smmu_hw_secure_implemented(s);
+    }
+
     switch (offset) {
     case A_GERROR_IRQ_CFG0:
         *data = s->gerror_irq_cfg0;
@@ -1700,6 +1976,31 @@ static MemTxResult smmu_readll(SMMUv3State *s, hwaddr offset,
     case A_EVENTQ_BASE:
         *data = s->eventq.base;
         return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GERROR_IRQ_CFG0", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gerror_irq_cfg0;
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE:
+        SMMU_CHECK_ATTRS_SECURE_READ("S_STRTAB_BASE");
+        *data = s->secure_strtab_base;
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CMDQ_BASE", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cmdq.base;
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_EVENTQ_BASE", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_eventq.base;
+        return MEMTX_OK;
     default:
         *data = 0;
         qemu_log_mask(LOG_UNIMP,
@@ -1712,6 +2013,11 @@ static MemTxResult smmu_readll(SMMUv3State *s, hwaddr offset,
 static MemTxResult smmu_readl(SMMUv3State *s, hwaddr offset,
                               uint64_t *data, MemTxAttrs attrs)
 {
+    bool secure_impl = false;
+    if (offset >= SMMU_SECURE_BASE_OFFSET) {
+        secure_impl = smmu_hw_secure_implemented(s);
+    }
+
     switch (offset) {
     case A_IDREGS ... A_IDREGS + 0x2f:
         *data = smmuv3_idreg(offset - A_IDREGS);
@@ -1797,6 +2103,151 @@ static MemTxResult smmu_readl(SMMUv3State *s, hwaddr offset,
         return MEMTX_OK;
     case A_EVENTQ_CONS:
         *data = s->eventq.cons;
+        return MEMTX_OK;
+    case A_S_IDR0 ... A_S_IDR4:
+        int idr_idx = (offset - A_S_IDR0) / 4;
+        g_assert(idr_idx >= 0 && idr_idx <= 4);
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       g_strdup_printf("S_IDR%d", idr_idx),
+                                       data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_idr[idr_idx];
+        return MEMTX_OK;
+    case A_S_CR0:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CR0", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cr[0];
+        return MEMTX_OK;
+    case A_S_CR0ACK:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CR0ACK", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cr0ack;
+        return MEMTX_OK;
+    case A_S_CR1:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CR1", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cr[1];
+        return MEMTX_OK;
+    case A_S_CR2:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CR2", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cr[2];
+        return MEMTX_OK;
+    case A_S_GBPA:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GBPA", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gbpa;
+        return MEMTX_OK;
+    case A_S_IRQ_CTRL:
+    case A_S_IRQ_CTRLACK:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_IRQ_CTRL", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_irq_ctrl;
+        return MEMTX_OK;
+    case A_S_GERROR:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GERROR", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gerror;
+        return MEMTX_OK;
+    case A_S_GERRORN:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GERRORN", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gerrorn;
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0:
+        SMMU_CHECK_SECURE_READ("S_GERROR_IRQ_CFG0");
+        *data = extract64(s->secure_gerror_irq_cfg0, 0, 32);
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG0 + 4:
+        SMMU_CHECK_SECURE_READ("S_GERROR_IRQ_CFG0+4");
+        *data = extract64(s->secure_gerror_irq_cfg0, 32, 32);
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG1:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GERROR_IRQ_CFG1", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gerror_irq_cfg1;
+        return MEMTX_OK;
+    case A_S_GERROR_IRQ_CFG2:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_GERROR_IRQ_CFG2", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_gerror_irq_cfg2;
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE:
+        SMMU_CHECK_ATTRS_SECURE_READ("S_STRTAB_BASE");
+        *data = extract64(s->secure_strtab_base, 0, 32);
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE + 4:
+        SMMU_CHECK_ATTRS_SECURE_READ("S_STRTAB_BASE+4");
+        *data = extract64(s->secure_strtab_base, 32, 32);
+        return MEMTX_OK;
+    case A_S_STRTAB_BASE_CFG:
+        SMMU_CHECK_ATTRS_SECURE_READ("S_STRTAB_BASE_CFG");
+        *data = s->secure_strtab_base_cfg;
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE:
+        SMMU_CHECK_SECURE_READ("S_CMDQ_BASE");
+        *data = extract64(s->secure_cmdq.base, 0, 32);
+        return MEMTX_OK;
+    case A_S_CMDQ_BASE + 4:
+        SMMU_CHECK_SECURE_READ("S_CMDQ_BASE");
+        *data = extract64(s->secure_cmdq.base, 32, 32);
+        return MEMTX_OK;
+    case A_S_CMDQ_PROD:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CMDQ_PROD", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cmdq.prod;
+        return MEMTX_OK;
+    case A_S_CMDQ_CONS:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_CMDQ_CONS", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_cmdq.cons;
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE:
+        SMMU_CHECK_SECURE_READ("S_EVENTQ_BASE");
+        *data = extract64(s->secure_eventq.base, 0, 32);
+        return MEMTX_OK;
+    case A_S_EVENTQ_BASE + 4:
+        SMMU_CHECK_SECURE_READ("S_EVENTQ_BASE");
+        *data = extract64(s->secure_eventq.base, 32, 32);
+        return MEMTX_OK;
+    case A_S_EVENTQ_PROD:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_EVENTQ_PROD", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_eventq.prod;
+        return MEMTX_OK;
+    case A_S_EVENTQ_CONS:
+        if (!smmu_validate_secure_read(attrs, secure_impl, offset,
+                                       "S_EVENTQ_CONS", data)) {
+            return MEMTX_OK;
+        }
+        *data = s->secure_eventq.cons;
         return MEMTX_OK;
     default:
         *data = 0;
