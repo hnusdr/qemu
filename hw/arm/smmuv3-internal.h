@@ -122,6 +122,11 @@ REG32(CR0,                 0x20)
 
 #define SMMU_CR0_RESERVED 0xFFFFFC20
 
+/*
+ * BIT1 and BIT4 are RES0 in SMMU_S_CRO
+ */
+#define SMMU_S_CR0_RESERVED 0xFFFFFC12
+
 REG32(CR0ACK,              0x24)
 REG32(CR1,                 0x28)
 REG32(CR2,                 0x2c)
