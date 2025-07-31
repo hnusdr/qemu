@@ -63,6 +63,29 @@ struct SMMUv3State {
     qemu_irq     irq[4];
     QemuMutex mutex;
     char *stage;
+
+    /* Secure state */
+    uint32_t secure_idr[5];
+    uint32_t secure_cr[3];
+    uint32_t secure_cr0ack;
+    uint32_t secure_init;
+    uint32_t secure_gbpa;
+    uint32_t secure_irq_ctrl;
+    uint32_t secure_gerror;
+    uint32_t secure_gerrorn;
+    uint64_t secure_gerror_irq_cfg0;
+    uint32_t secure_gerror_irq_cfg1;
+    uint32_t secure_gerror_irq_cfg2;
+    uint64_t secure_strtab_base;
+    uint32_t secure_strtab_base_cfg;
+    uint8_t  secure_sid_split;
+    uint32_t secure_features;
+
+    uint64_t secure_eventq_irq_cfg0;
+    uint32_t secure_eventq_irq_cfg1;
+    uint32_t secure_eventq_irq_cfg2;
+
+    SMMUQueue secure_eventq, secure_cmdq;
 };
 
 typedef enum {
