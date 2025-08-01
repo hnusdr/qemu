@@ -920,6 +920,21 @@ static void smmuv3_flush_config(SMMUDevice *sdev)
     g_hash_table_remove(bc->configs, sdev);
 }
 
+static void smmuv3_invalidate_all_caches(SMMUv3State *s)
+{
+    trace_smmuv3_invalidate_all_caches();
+    SMMUState *bs = &s->smmu_state;
+
+    /* Clear all cached configs including STE and CD*/
+    if (bs->configs) {
+        g_hash_table_remove_all(bs->configs);
+    }
+
+    /* Invalidate all SMMU IOTLB entries */
+    smmu_inv_notifiers_all(&s->smmu_state);
+    smmu_iotlb_inv_all(bs);
+}
+
 /* Do translation with TLB lookup. */
 static SMMUTranslationStatus smmuv3_do_translate(SMMUv3State *s, hwaddr addr,
                                                  SMMUTransCfg *cfg,
@@ -1921,6 +1936,16 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         SMMU_CHECK_ATTRS_SECURE("S_EVENTQ_IRQ_CFG2");
         s->secure_eventq_irq_cfg2 = data;
         return MEMTX_OK;
+    case A_S_INIT:
+        SMMU_CHECK_SECURE_WRITE("S_INIT");
+        if (data & R_S_INIT_INV_ALL_MASK) {
+            /* write S_INIT and poll*/
+            s->secure_init = data & R_S_INIT_INV_ALL_MASK;
+            smmuv3_invalidate_all_caches(s);
+        }
+        /* initialization is completed and set to 0 to terminate the polling */
+        s->secure_init = 0;
+        return MEMTX_OK;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s Unexpected 32-bit access to 0x%"PRIx64" (WI)\n",
@@ -2248,6 +2273,10 @@ static MemTxResult smmu_readl(SMMUv3State *s, hwaddr offset,
             return MEMTX_OK;
         }
         *data = s->secure_eventq.cons;
+        return MEMTX_OK;
+    case A_S_INIT:
+        SMMU_CHECK_SECURE_READ("S_INIT");
+        *data = s->secure_init;
         return MEMTX_OK;
     default:
         *data = 0;
