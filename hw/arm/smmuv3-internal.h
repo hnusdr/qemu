@@ -319,9 +319,13 @@ static inline void queue_cons_incr(SMMUQueue *q)
     q->cons = deposit32(q->cons, 0, q->log2size + 1, q->cons + 1);
 }
 
-static inline bool smmuv3_cmdq_enabled(SMMUv3State *s)
+static inline bool smmuv3_cmdq_enabled(SMMUv3State *s, bool is_secure)
 {
-    return FIELD_EX32(s->cr[0], CR0, CMDQEN);
+    if (is_secure) {
+        return FIELD_EX32(s->secure_cr[0], S_CR0, CMDQEN);
+    } else {
+        return FIELD_EX32(s->cr[0], CR0, CMDQEN);
+    }
 }
 
 static inline bool smmuv3_eventq_enabled(SMMUv3State *s)
