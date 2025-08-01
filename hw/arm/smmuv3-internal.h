@@ -234,6 +234,8 @@ REG32(S_STRTAB_BASE_CFG,    0x8088)
 REG64(S_CMDQ_BASE,          0x8090)
 REG32(S_CMDQ_PROD,          0x8098)
 REG32(S_CMDQ_CONS,          0x809c)
+    FIELD(S_CMDQ_CONS, ERR,      24, 7)
+
 REG64(S_EVENTQ_BASE,        0x80a0)
 REG32(S_EVENTQ_PROD,        0x80a8)
 REG32(S_EVENTQ_CONS,        0x80ac)
@@ -269,14 +271,22 @@ static inline uint32_t smmuv3_idreg(int regoffset)
     return smmuv3_ids[regoffset / 4];
 }
 
-static inline bool smmuv3_eventq_irq_enabled(SMMUv3State *s)
+static inline bool smmuv3_eventq_irq_enabled(SMMUv3State *s, bool is_secure)
 {
-    return FIELD_EX32(s->irq_ctrl, IRQ_CTRL, EVENTQ_IRQEN);
+    if (is_secure) {
+        return FIELD_EX32(s->secure_irq_ctrl, S_IRQ_CTRL, EVENTQ_IRQEN);
+    } else {
+        return FIELD_EX32(s->irq_ctrl, IRQ_CTRL, EVENTQ_IRQEN);
+    }
 }
 
-static inline bool smmuv3_gerror_irq_enabled(SMMUv3State *s)
+static inline bool smmuv3_gerror_irq_enabled(SMMUv3State *s, bool is_secure)
 {
-    return FIELD_EX32(s->irq_ctrl, IRQ_CTRL, GERROR_IRQEN);
+    if (is_secure) {
+        return FIELD_EX32(s->secure_irq_ctrl, S_IRQ_CTRL, GERROR_IRQEN);
+    } else {
+        return FIELD_EX32(s->irq_ctrl, IRQ_CTRL, GERROR_IRQEN);
+    }
 }
 
 /* Queue Handling */
@@ -328,14 +338,24 @@ static inline bool smmuv3_cmdq_enabled(SMMUv3State *s, bool is_secure)
     }
 }
 
-static inline bool smmuv3_eventq_enabled(SMMUv3State *s)
+static inline bool smmuv3_eventq_enabled(SMMUv3State *s, bool is_secure)
 {
-    return FIELD_EX32(s->cr[0], CR0, EVENTQEN);
+    if (is_secure) {
+        return FIELD_EX32(s->secure_cr[0], S_CR0, EVENTQEN);
+    } else {
+        return FIELD_EX32(s->cr[0], CR0, EVENTQEN);
+    }
 }
 
-static inline void smmu_write_cmdq_err(SMMUv3State *s, uint32_t err_type)
+static inline void smmu_write_cmdq_err(SMMUv3State *s, uint32_t err_type,
+                                       bool is_secure)
 {
-    s->cmdq.cons = FIELD_DP32(s->cmdq.cons, CMDQ_CONS, ERR, err_type);
+    if (is_secure) {
+        s->secure_cmdq.cons = FIELD_DP32(s->secure_cmdq.cons, S_CMDQ_CONS,
+                                         ERR, err_type);
+    } else {
+        s->cmdq.cons = FIELD_DP32(s->cmdq.cons, CMDQ_CONS, ERR, err_type);
+    }
 }
 
 /* Commands */
@@ -589,7 +609,7 @@ typedef struct SMMUEventInfo {
             (x)->word[6] = (uint32_t)(addr & 0xffffffff); \
     } while (0)
 
-void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *event);
+void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *event, bool is_secure);
 
 /* Configuration Data */
 

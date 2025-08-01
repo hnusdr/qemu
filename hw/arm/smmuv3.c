@@ -48,14 +48,14 @@
  * @gerror_mask: mask of gerrors to toggle (relevant if @irq is GERROR)
  */
 static void smmuv3_trigger_irq(SMMUv3State *s, SMMUIrq irq,
-                               uint32_t gerror_mask)
+                               uint32_t gerror_mask, bool is_secure)
 {
 
     bool pulse = false;
 
     switch (irq) {
     case SMMU_IRQ_EVTQ:
-        pulse = smmuv3_eventq_irq_enabled(s);
+        pulse = smmuv3_eventq_irq_enabled(s, is_secure);
         break;
     case SMMU_IRQ_PRIQ:
         qemu_log_mask(LOG_UNIMP, "PRI not yet supported\n");
@@ -65,17 +65,23 @@ static void smmuv3_trigger_irq(SMMUv3State *s, SMMUIrq irq,
         break;
     case SMMU_IRQ_GERROR:
     {
-        uint32_t pending = s->gerror ^ s->gerrorn;
+        uint32_t pending = is_secure ? s->secure_gerror ^ s->secure_gerrorn :
+            s->gerror ^ s->gerrorn;
         uint32_t new_gerrors = ~pending & gerror_mask;
 
         if (!new_gerrors) {
             /* only toggle non pending errors */
             return;
         }
-        s->gerror ^= new_gerrors;
-        trace_smmuv3_write_gerror(new_gerrors, s->gerror);
+        if (is_secure) {
+            s->secure_gerror ^= new_gerrors;
+        } else {
+            s->gerror ^= new_gerrors;
+        }
+        trace_smmuv3_write_gerror(new_gerrors, is_secure ? s->secure_gerror :
+            s->gerror);
 
-        pulse = smmuv3_gerror_irq_enabled(s);
+        pulse = smmuv3_gerror_irq_enabled(s, is_secure);
         break;
     }
     }
@@ -85,24 +91,32 @@ static void smmuv3_trigger_irq(SMMUv3State *s, SMMUIrq irq,
     }
 }
 
-static void smmuv3_write_gerrorn(SMMUv3State *s, uint32_t new_gerrorn)
+static void smmuv3_write_gerrorn(SMMUv3State *s, uint32_t new_gerrorn,
+                                 bool is_secure)
 {
-    uint32_t pending = s->gerror ^ s->gerrorn;
-    uint32_t toggled = s->gerrorn ^ new_gerrorn;
+    uint32_t pending = is_secure ? s->secure_gerror ^ s->secure_gerrorn :
+        s->gerror ^ s->gerrorn;
+    uint32_t toggled = is_secure ? s->secure_gerrorn ^ new_gerrorn :
+        s->gerrorn ^ new_gerrorn;
 
     if (toggled & ~pending) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "guest toggles non pending errors = 0x%x\n",
-                      toggled & ~pending);
+                      "guest toggles non pending errors = 0x%x is_secure=%d\n",
+                      toggled & ~pending, is_secure);
     }
 
     /*
      * We do not raise any error in case guest toggles bits corresponding
      * to not active IRQs (CONSTRAINED UNPREDICTABLE)
      */
-    s->gerrorn = new_gerrorn;
+    if (is_secure) {
+        s->secure_gerrorn = new_gerrorn;
+    } else {
+        s->gerrorn = new_gerrorn;
+    }
 
-    trace_smmuv3_write_gerrorn(toggled & pending, s->gerrorn);
+    trace_smmuv3_write_gerrorn(toggled & pending,
+                               is_secure ? s->secure_gerrorn : s->gerrorn);
 }
 
 static inline MemTxResult queue_read(SMMUQueue *q, Cmd *cmd, bool is_secure)
@@ -125,18 +139,21 @@ static inline MemTxResult queue_read(SMMUQueue *q, Cmd *cmd, bool is_secure)
     return ret;
 }
 
-static MemTxResult queue_write(SMMUQueue *q, Evt *evt_in)
+static MemTxResult queue_write(SMMUQueue *q, Evt *evt_in, bool is_secure)
 {
     dma_addr_t addr = Q_PROD_ENTRY(q);
     MemTxResult ret;
     Evt evt = *evt_in;
     int i;
+    MemTxAttrs attrs = is_secure ?
+        (MemTxAttrs) { .secure = 1 } :
+        (MemTxAttrs) { .unspecified = true };
 
     for (i = 0; i < ARRAY_SIZE(evt.word); i++) {
         cpu_to_le32s(&evt.word[i]);
     }
     ret = dma_memory_write(&address_space_memory, addr, &evt, sizeof(Evt),
-                           MEMTXATTRS_UNSPECIFIED);
+                           attrs);
     if (ret != MEMTX_OK) {
         return ret;
     }
@@ -145,12 +162,12 @@ static MemTxResult queue_write(SMMUQueue *q, Evt *evt_in)
     return MEMTX_OK;
 }
 
-static MemTxResult smmuv3_write_eventq(SMMUv3State *s, Evt *evt)
+static MemTxResult smmuv3_write_eventq(SMMUv3State *s, Evt *evt, bool is_secure)
 {
-    SMMUQueue *q = &s->eventq;
+    SMMUQueue *q = is_secure ? &s->secure_eventq : &s->eventq;
     MemTxResult r;
 
-    if (!smmuv3_eventq_enabled(s)) {
+    if (!smmuv3_eventq_enabled(s, is_secure)) {
         return MEMTX_ERROR;
     }
 
@@ -158,23 +175,23 @@ static MemTxResult smmuv3_write_eventq(SMMUv3State *s, Evt *evt)
         return MEMTX_ERROR;
     }
 
-    r = queue_write(q, evt);
+    r = queue_write(q, evt, is_secure);
     if (r != MEMTX_OK) {
         return r;
     }
 
     if (!smmuv3_q_empty(q)) {
-        smmuv3_trigger_irq(s, SMMU_IRQ_EVTQ, 0);
+        smmuv3_trigger_irq(s, SMMU_IRQ_EVTQ, 0, is_secure);
     }
     return MEMTX_OK;
 }
 
-void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info)
+void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info, bool is_secure)
 {
     Evt evt = {};
     MemTxResult r;
 
-    if (!smmuv3_eventq_enabled(s)) {
+    if (!smmuv3_eventq_enabled(s, is_secure)) {
         return;
     }
 
@@ -252,10 +269,12 @@ void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info)
         g_assert_not_reached();
     }
 
-    trace_smmuv3_record_event(smmu_event_string(info->type), info->sid);
-    r = smmuv3_write_eventq(s, &evt);
+    trace_smmuv3_record_event(smmu_event_string(info->type),
+                              info->sid, is_secure);
+    r = smmuv3_write_eventq(s, &evt, is_secure);
     if (r != MEMTX_OK) {
-        smmuv3_trigger_irq(s, SMMU_IRQ_GERROR, R_GERROR_EVENTQ_ABT_ERR_MASK);
+        smmuv3_trigger_irq(s, SMMU_IRQ_GERROR, R_GERROR_EVENTQ_ABT_ERR_MASK,
+                           is_secure);
     }
     info->recorded = true;
 }
@@ -1148,7 +1167,7 @@ epilogue:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s translation failed for iova=0x%"PRIx64" (%s)\n",
                       mr->parent_obj.name, addr, smmu_event_string(event.type));
-        smmuv3_record_event(s, &event);
+        smmuv3_record_event(s, &event, false);
         break;
     }
 
@@ -1358,7 +1377,7 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
         switch (type) {
         case SMMU_CMD_SYNC:
             if (CMD_SYNC_CS(&cmd) & CMD_SYNC_SIG_IRQ) {
-                smmuv3_trigger_irq(s, SMMU_IRQ_CMD_SYNC, 0);
+                smmuv3_trigger_irq(s, SMMU_IRQ_CMD_SYNC, 0, is_secure);
             }
             break;
         case SMMU_CMD_PREFETCH_CONFIG:
@@ -1544,8 +1563,9 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
 
     if (cmd_error) {
         trace_smmuv3_cmdq_consume_error(smmu_cmd_string(type), cmd_error);
-        smmu_write_cmdq_err(s, cmd_error);
-        smmuv3_trigger_irq(s, SMMU_IRQ_GERROR, R_GERROR_CMDQ_ERR_MASK);
+        smmu_write_cmdq_err(s, cmd_error, is_secure);
+        smmuv3_trigger_irq(s, SMMU_IRQ_GERROR,
+                           R_GERROR_CMDQ_ERR_MASK, is_secure);
     }
 
     trace_smmuv3_cmdq_consume_out(Q_PROD(q), Q_CONS(q),
@@ -1731,7 +1751,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         s->irq_ctrl = data;
         return MEMTX_OK;
     case A_GERRORN:
-        smmuv3_write_gerrorn(s, data);
+        smmuv3_write_gerrorn(s, data, false);
         /*
          * By acknowledging the CMDQ_ERR, SW may notify cmds can
          * be processed again
@@ -1848,7 +1868,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         return MEMTX_OK;
     case A_S_GERRORN:
         SMMU_CHECK_SECURE_WRITE("S_GERRORN");
-        smmuv3_write_gerrorn(s, data);
+        smmuv3_write_gerrorn(s, data, true);
         smmuv3_cmdq_consume(s, true);
         return MEMTX_OK;
     case A_S_GERROR_IRQ_CFG0:
