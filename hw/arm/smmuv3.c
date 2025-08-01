@@ -105,14 +105,17 @@ static void smmuv3_write_gerrorn(SMMUv3State *s, uint32_t new_gerrorn)
     trace_smmuv3_write_gerrorn(toggled & pending, s->gerrorn);
 }
 
-static inline MemTxResult queue_read(SMMUQueue *q, Cmd *cmd)
+static inline MemTxResult queue_read(SMMUQueue *q, Cmd *cmd, bool is_secure)
 {
     dma_addr_t addr = Q_CONS_ENTRY(q);
     MemTxResult ret;
     int i;
+    MemTxAttrs attrs = is_secure ?
+        (MemTxAttrs) { .secure = 1 } :
+        (MemTxAttrs) { .unspecified = true };
 
     ret = dma_memory_read(&address_space_memory, addr, cmd, sizeof(Cmd),
-                          MEMTXATTRS_UNSPECIFIED);
+                          attrs);
     if (ret != MEMTX_OK) {
         return ret;
     }
@@ -1311,14 +1314,14 @@ static inline bool smmu_hw_secure_implemented(SMMUv3State *s)
     return FIELD_EX32(s->secure_idr[1], S_IDR1, SECURE_IMPL);
 }
 
-static int smmuv3_cmdq_consume(SMMUv3State *s)
+static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
 {
     SMMUState *bs = ARM_SMMU(s);
     SMMUCmdError cmd_error = SMMU_CERROR_NONE;
-    SMMUQueue *q = &s->cmdq;
+    SMMUQueue *q = is_secure ? &s->secure_cmdq : &s->cmdq;
     SMMUCommandType type = 0;
 
-    if (!smmuv3_cmdq_enabled(s)) {
+    if (!smmuv3_cmdq_enabled(s, is_secure)) {
         return 0;
     }
     /*
@@ -1329,17 +1332,20 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
      */
 
     while (!smmuv3_q_empty(q)) {
-        uint32_t pending = s->gerror ^ s->gerrorn;
+        uint32_t pending = is_secure ? s->secure_gerror ^ s->secure_gerrorn :
+            s->gerror ^ s->gerrorn;
         Cmd cmd;
 
         trace_smmuv3_cmdq_consume(Q_PROD(q), Q_CONS(q),
-                                  Q_PROD_WRAP(q), Q_CONS_WRAP(q));
+                                  Q_PROD_WRAP(q), Q_CONS_WRAP(q),
+                                  is_secure);
 
-        if (FIELD_EX32(pending, GERROR, CMDQ_ERR)) {
+        if (is_secure ? FIELD_EX32(pending, S_GERROR, CMDQ_ERR) :
+            FIELD_EX32(pending, GERROR, CMDQ_ERR)) {
             break;
         }
 
-        if (queue_read(q, &cmd) != MEMTX_OK) {
+        if (queue_read(q, &cmd, is_secure) != MEMTX_OK) {
             cmd_error = SMMU_CERROR_ABT;
             break;
         }
@@ -1364,8 +1370,11 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
             SMMUDevice *sdev = smmu_find_sdev(bs, sid);
 
             if (CMD_SSEC(&cmd)) {
-                cmd_error = SMMU_CERROR_ILL;
-                break;
+                if (!is_secure) {
+                    /* Secure Stream with NON-Secure command */
+                    cmd_error = SMMU_CERROR_ILL;
+                    break;
+                }
             }
 
             if (!sdev) {
@@ -1384,8 +1393,10 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
             SMMUSIDRange sid_range;
 
             if (CMD_SSEC(&cmd)) {
-                cmd_error = SMMU_CERROR_ILL;
-                break;
+                if (!is_secure) {
+                    cmd_error = SMMU_CERROR_ILL;
+                    break;
+                }
             }
 
             mask = (1ULL << (range + 1)) - 1;
@@ -1403,8 +1414,10 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
             SMMUDevice *sdev = smmu_find_sdev(bs, sid);
 
             if (CMD_SSEC(&cmd)) {
-                cmd_error = SMMU_CERROR_ILL;
-                break;
+                if (!is_secure) {
+                    cmd_error = SMMU_CERROR_ILL;
+                    break;
+                }
             }
 
             if (!sdev) {
@@ -1706,7 +1719,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         s->cr[0] = data;
         s->cr0ack = data & ~SMMU_CR0_RESERVED;
         /* in case the command queue has been enabled */
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, false);
         return MEMTX_OK;
     case A_CR1:
         s->cr[1] = data;
@@ -1723,7 +1736,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
          * By acknowledging the CMDQ_ERR, SW may notify cmds can
          * be processed again
          */
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, false);
         return MEMTX_OK;
     case A_GERROR_IRQ_CFG0: /* 64b */
         s->gerror_irq_cfg0 = deposit64(s->gerror_irq_cfg0, 0, 32, data);
@@ -1772,7 +1785,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         return MEMTX_OK;
     case A_CMDQ_PROD:
         s->cmdq.prod = data;
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, false);
         return MEMTX_OK;
     case A_CMDQ_CONS:
         s->cmdq.cons = data;
@@ -1810,7 +1823,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
         s->secure_cr[0] = data;
         /* clear reserved bits */
         s->secure_cr0ack = data & ~SMMU_S_CR0_RESERVED;
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, true);
         return MEMTX_OK;
     case A_S_CR1:
         if (!smmu_validate_secure_write(attrs, secure_impl, offset,
@@ -1836,7 +1849,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
     case A_S_GERRORN:
         SMMU_CHECK_SECURE_WRITE("S_GERRORN");
         smmuv3_write_gerrorn(s, data);
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, true);
         return MEMTX_OK;
     case A_S_GERROR_IRQ_CFG0:
         SMMU_CHECK_ATTRS_SECURE("S_GERROR_IRQ_CFG0");
@@ -1892,7 +1905,7 @@ static MemTxResult smmu_writel(SMMUv3State *s, hwaddr offset,
     case A_S_CMDQ_PROD:
         SMMU_CHECK_SECURE_WRITE("S_CMDQ_PROD");
         s->secure_cmdq.prod = data;
-        smmuv3_cmdq_consume(s);
+        smmuv3_cmdq_consume(s, true);
         return MEMTX_OK;
     case A_S_CMDQ_CONS:
         SMMU_CHECK_SECURE_WRITE("S_CMDQ_CONS");
