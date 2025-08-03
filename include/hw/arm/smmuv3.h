@@ -110,4 +110,8 @@ OBJECT_DECLARE_TYPE(SMMUv3State, SMMUv3Class, ARM_SMMUV3)
 #define STAGE1_SUPPORTED(s)      FIELD_EX32(s->idr[0], IDR0, S1P)
 #define STAGE2_SUPPORTED(s)      FIELD_EX32(s->idr[0], IDR0, S2P)
 
+#define SECURE_IMPLEMENTED(s)  \
+    FIELD_DP32(s->secure_idr[1], S_IDR1, SECURE_IMPL, 1)
+#define SECURE_S2_SUPPORTED(s) \
+    FIELD_DP32(s->secure_idr[1], S_IDR1, SEL2, 1)
 #endif

@@ -243,9 +243,13 @@ REG64(S_EVENTQ_IRQ_CFG0,    0x80b0)
 REG32(S_EVENTQ_IRQ_CFG1,    0x80b8)
 REG32(S_EVENTQ_IRQ_CFG2,    0x80bc)
 
-static inline int smmu_enabled(SMMUv3State *s)
+static inline int smmu_enabled(SMMUv3State *s, bool is_secure)
 {
-    return FIELD_EX32(s->cr[0], CR0, SMMU_ENABLE);
+    if (is_secure) {
+        return FIELD_EX32(s->secure_cr[0], S_CR0, SMMUEN);
+    } else {
+        return FIELD_EX32(s->cr[0], CR0, SMMU_ENABLE);
+    }
 }
 
 /* Command Queue Entry */
@@ -661,6 +665,10 @@ typedef struct CD {
 #define STE_S2S(x)         extract32((x)->word[5], 25, 1)
 #define STE_S2R(x)         extract32((x)->word[5], 26, 1)
 
+#define STE_S_S2T0SZ(x)      extract32((x)->word[9], 0 , 6)
+#define STE_S_S2SL0(x)       extract32((x)->word[9], 6 , 2)
+#define STE_S_S2TG(x)        extract32((x)->word[9], 14, 2)
+
 #define STE_CTXPTR(x)                                   \
     ((extract64((x)->word[1], 0, 16) << 32) |           \
      ((x)->word[0] & 0xffffffc0))
@@ -668,6 +676,10 @@ typedef struct CD {
 #define STE_S2TTB(x)                                    \
     ((extract64((x)->word[7], 0, 16) << 32) |           \
      ((x)->word[6] & 0xfffffff0))
+
+#define STE_S_S2TTB(x)                                  \
+    ((extract64((x)->word[13], 0, 16) << 32) |          \
+     ((x)->word[12] & 0xfffffff0))
 
 static inline int oas2bits(int oas_field)
 {

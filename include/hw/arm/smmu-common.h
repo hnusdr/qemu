@@ -116,6 +116,7 @@ typedef struct SMMUTransCfg {
     SMMUTransTableInfo tt[2];
     /* Used by stage-2 only. */
     struct SMMUS2Cfg s2cfg;
+    bool secure;
 } SMMUTransCfg;
 
 typedef struct SMMUDevice {
