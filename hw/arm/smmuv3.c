@@ -354,14 +354,14 @@ static void smmuv3_init_regs(SMMUv3State *s)
 }
 
 static int smmu_get_ste(SMMUv3State *s, dma_addr_t addr, STE *buf,
-                        SMMUEventInfo *event)
+                        SMMUEventInfo *event, MemTxAttrs attrs)
 {
     int ret, i;
 
     trace_smmuv3_get_ste(addr);
     /* TODO: guarantee 64-bit single-copy atomicity */
     ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
-                          MEMTXATTRS_UNSPECIFIED);
+                          attrs);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -390,6 +390,9 @@ static int smmu_get_cd(SMMUv3State *s, STE *ste, SMMUTransCfg *cfg,
     int ret, i;
     SMMUTranslationStatus status;
     SMMUTLBEntry *entry;
+    MemTxAttrs attrs = cfg->secure ?
+        (MemTxAttrs) { .secure = 1 } :
+        (MemTxAttrs) { .unspecified = true };
 
     trace_smmuv3_get_cd(addr);
 
@@ -407,7 +410,7 @@ static int smmu_get_cd(SMMUv3State *s, STE *ste, SMMUTransCfg *cfg,
 
     /* TODO: guarantee 64-bit single-copy atomicity */
     ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
-                          MEMTXATTRS_UNSPECIFIED);
+                          attrs);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -472,7 +475,8 @@ static int decode_ste_s2_cfg(SMMUv3State *s, SMMUTransCfg *cfg,
         g_assert_not_reached();
     }
 
-    switch (STE_S2TG(ste)) {
+    uint32_t s2tg = cfg->secure ? STE_S_S2TG(ste) : STE_S2TG(ste);
+    switch (s2tg) {
     case 0x0: /* 4KB */
         cfg->s2cfg.granule_sz = 12;
         break;
@@ -484,13 +488,13 @@ static int decode_ste_s2_cfg(SMMUv3State *s, SMMUTransCfg *cfg,
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "SMMUv3 bad STE S2TG: %x\n", STE_S2TG(ste));
+                      "SMMUv3 bad STE S2TG: %x\n", s2tg);
         goto bad_ste;
     }
 
-    cfg->s2cfg.vttb = STE_S2TTB(ste);
+    cfg->s2cfg.vttb = cfg->secure ? STE_S_S2TTB(ste) : STE_S2TTB(ste);
 
-    cfg->s2cfg.sl0 = STE_S2SL0(ste);
+    cfg->s2cfg.sl0 = cfg->secure ? STE_S_S2SL0(ste) : STE_S2SL0(ste);
     /* FEAT_TTST not supported. */
     if (cfg->s2cfg.sl0 == 0x3) {
         qemu_log_mask(LOG_UNIMP, "SMMUv3 S2SL0 = 0x3 has no meaning!\n");
@@ -519,7 +523,7 @@ static int decode_ste_s2_cfg(SMMUv3State *s, SMMUTransCfg *cfg,
         goto bad_ste;
     }
 
-    cfg->s2cfg.tsz = STE_S2T0SZ(ste);
+    cfg->s2cfg.tsz = cfg->secure ? STE_S_S2T0SZ(ste) : STE_S2T0SZ(ste);
 
     if (!s2t0sz_valid(cfg)) {
         qemu_log_mask(LOG_GUEST_ERROR, "SMMUv3 bad STE S2T0SZ = %d\n",
@@ -599,21 +603,52 @@ static int decode_ste(SMMUv3State *s, SMMUTransCfg *cfg,
     if (cfg->aborted || cfg->bypassed) {
         return 0;
     }
+    bool is_secure = cfg->secure;
 
     /*
      * If a stage is enabled in SW while not advertised, throw bad ste
      * according to user manual(IHI0070E) "5.2 Stream Table Entry".
      */
-    if (!STAGE1_SUPPORTED(s) && STE_CFG_S1_ENABLED(config)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "SMMUv3 S1 used but not supported.\n");
-        goto bad_ste;
-    }
-    if (!STAGE2_SUPPORTED(s) && STE_CFG_S2_ENABLED(config)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "SMMUv3 S2 used but not supported.\n");
-        goto bad_ste;
+    if (!is_secure) {
+        if (!STAGE1_SUPPORTED(s) && STE_CFG_S1_ENABLED(config)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SMMUv3 S1 used but not supported.\n");
+            goto bad_ste;
+        }
+        if (!STAGE2_SUPPORTED(s) && STE_CFG_S2_ENABLED(config)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SMMUv3 S2 used but not supported.\n");
+            goto bad_ste;
+        }
+    } else {
+        /*
+         * As described in user manual(IHI0070G.b) "3.10.2 Support for Secure
+         * state" , the SMMU supports stage 1 translation and might support
+         * stage 2 translation.
+         */
+        if (!SECURE_IMPLEMENTED(s) && STE_CFG_S1_ENABLED(config)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                "SMMUv3 S1 used but not supported in secure state.\n");
+            goto bad_ste;
+        }
+
+        /*
+         * IHI0070G.b "6.3.53 SMMU_S_IDR1": SEL2 == 0 if SMMU_IDR0.S1P == 0 or
+         * if SMMU_IDR0.S2P == 0.
+         */
+        if (STE_CFG_S2_ENABLED(config)) {
+            if (!SECURE_S2_SUPPORTED(s) ||
+                (SECURE_S2_SUPPORTED(s) &&
+                (!STAGE1_SUPPORTED(s) || !STAGE2_SUPPORTED(s)))) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                    "SMMUv3 S2 used but not supported in secure state.\n");
+                goto bad_ste;
+            }
+        }
     }
 
-    if (STAGE2_SUPPORTED(s)) {
+    if ((!is_secure && STAGE2_SUPPORTED(s)) ||
+        (is_secure && SECURE_S2_SUPPORTED(s))) {
         /* VMID is considered even if s2 is disabled. */
         cfg->s2cfg.vmid = STE_S2VMID(ste);
     } else {
@@ -659,20 +694,29 @@ bad_ste:
  * @sid: stream ID
  * @ste: returned stream table entry
  * @event: handle to an event info
+ * @is_secure: true if the translation is for a secure domain
  *
  * Supports linear and 2-level stream table
  * Return 0 on success, -EINVAL otherwise
  */
 static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
-                         SMMUEventInfo *event)
+                         SMMUEventInfo *event, bool is_secure)
 {
-    dma_addr_t addr, strtab_base;
+    dma_addr_t addr;
     uint32_t log2size;
     int strtab_size_shift;
     int ret;
+    uint32_t features = is_secure ? s->secure_features : s->features;
+    dma_addr_t strtab_base = is_secure ? s->secure_strtab_base : s->strtab_base;
+    uint8_t sid_split = is_secure ? s->secure_sid_split : s->sid_split;
+    MemTxAttrs attrs = is_secure ?
+        (MemTxAttrs) { .secure = 1 } :
+        (MemTxAttrs) { .unspecified = true };
 
-    trace_smmuv3_find_ste(sid, s->features, s->sid_split);
-    log2size = FIELD_EX32(s->strtab_base_cfg, STRTAB_BASE_CFG, LOG2SIZE);
+    trace_smmuv3_find_ste(sid, features, sid_split, is_secure);
+    log2size = is_secure
+        ? FIELD_EX32(s->secure_strtab_base_cfg, S_STRTAB_BASE_CFG, LOG2SIZE)
+        : FIELD_EX32(s->strtab_base_cfg, STRTAB_BASE_CFG, LOG2SIZE);
     /*
      * Check SID range against both guest-configured and implementation limits
      */
@@ -680,7 +724,7 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
         event->type = SMMU_EVT_C_BAD_STREAMID;
         return -EINVAL;
     }
-    if (s->features & SMMU_FEATURE_2LVL_STE) {
+    if (features & SMMU_FEATURE_2LVL_STE) {
         int l1_ste_offset, l2_ste_offset, max_l2_ste, span, i;
         dma_addr_t l1ptr, l2ptr;
         STEDesc l1std;
@@ -689,15 +733,15 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
          * Align strtab base address to table size. For this purpose, assume it
          * is not bounded by SMMU_IDR1_SIDSIZE.
          */
-        strtab_size_shift = MAX(5, (int)log2size - s->sid_split - 1 + 3);
-        strtab_base = s->strtab_base & SMMU_BASE_ADDR_MASK &
+        strtab_size_shift = MAX(5, (int)log2size - sid_split - 1 + 3);
+        strtab_base = strtab_base & SMMU_BASE_ADDR_MASK &
                       ~MAKE_64BIT_MASK(0, strtab_size_shift);
-        l1_ste_offset = sid >> s->sid_split;
-        l2_ste_offset = sid & ((1 << s->sid_split) - 1);
+        l1_ste_offset = sid >> sid_split;
+        l2_ste_offset = sid & ((1 << sid_split) - 1);
         l1ptr = (dma_addr_t)(strtab_base + l1_ste_offset * sizeof(l1std));
         /* TODO: guarantee 64-bit single-copy atomicity */
         ret = dma_memory_read(&address_space_memory, l1ptr, &l1std,
-                              sizeof(l1std), MEMTXATTRS_UNSPECIFIED);
+                              sizeof(l1std), attrs);
         if (ret != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "Could not read L1PTR at 0X%"PRIx64"\n", l1ptr);
@@ -722,7 +766,7 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
         }
         max_l2_ste = (1 << span) - 1;
         l2ptr = l1std_l2ptr(&l1std);
-        trace_smmuv3_find_ste_2lvl(s->strtab_base, l1ptr, l1_ste_offset,
+        trace_smmuv3_find_ste_2lvl(strtab_base, l1ptr, l1_ste_offset,
                                    l2ptr, l2_ste_offset, max_l2_ste);
         if (l2_ste_offset > max_l2_ste) {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -734,12 +778,12 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
         addr = l2ptr + l2_ste_offset * sizeof(*ste);
     } else {
         strtab_size_shift = log2size + 5;
-        strtab_base = s->strtab_base & SMMU_BASE_ADDR_MASK &
+        strtab_base = strtab_base & SMMU_BASE_ADDR_MASK &
                       ~MAKE_64BIT_MASK(0, strtab_size_shift);
         addr = strtab_base + sid * sizeof(*ste);
     }
 
-    if (smmu_get_ste(s, addr, ste, event)) {
+    if (smmu_get_ste(s, addr, ste, event, attrs)) {
         return -EINVAL;
     }
 
@@ -868,7 +912,7 @@ static int smmuv3_decode_config(IOMMUMemoryRegion *mr, SMMUTransCfg *cfg,
     /* ASID defaults to -1 (if s1 is not supported). */
     cfg->asid = -1;
 
-    ret = smmu_find_ste(s, sid, &ste, event);
+    ret = smmu_find_ste(s, sid, &ste, event, cfg->secure);
     if (ret) {
         return ret;
     }
@@ -897,12 +941,14 @@ static int smmuv3_decode_config(IOMMUMemoryRegion *mr, SMMUTransCfg *cfg,
  *
  * @sdev: SMMUDevice handle
  * @event: output event info
+ * @is_secure: true if the translation is for a secure domain
  *
  * The configuration cache contains data resulting from both STE and CD
  * decoding under the form of an SMMUTransCfg struct. The hash table is indexed
  * by the SMMUDevice handle.
  */
-static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event)
+static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event,
+                                       bool is_secure)
 {
     SMMUv3State *s = sdev->smmu;
     SMMUState *bc = &s->smmu_state;
@@ -922,6 +968,7 @@ static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event)
                             100 * sdev->cfg_cache_hits /
                             (sdev->cfg_cache_hits + sdev->cfg_cache_misses));
         cfg = g_new0(SMMUTransCfg, 1);
+        cfg->secure = is_secure;
 
         if (!smmuv3_decode_config(&sdev->iommu, cfg, event)) {
             g_hash_table_insert(bc->configs, sdev, cfg);
@@ -1103,19 +1150,25 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         .perm = IOMMU_NONE,
     };
     SMMUTLBEntry *cached_entry = NULL;
+    /* We don't support secure translation for now */
+    bool is_secure = false;
 
     qemu_mutex_lock(&s->mutex);
 
-    if (!smmu_enabled(s)) {
-        if (FIELD_EX32(s->gbpa, GBPA, ABORT)) {
-            status = SMMU_TRANS_ABORT;
+    if (!smmu_enabled(s, is_secure)) {
+        bool abort_flag;
+
+        if (is_secure) {
+            abort_flag = FIELD_EX32(s->secure_gbpa, S_GBPA, ABORT);
         } else {
-            status = SMMU_TRANS_DISABLE;
+            abort_flag = FIELD_EX32(s->gbpa, GBPA, ABORT);
         }
+
+        status = abort_flag ? SMMU_TRANS_ABORT : SMMU_TRANS_DISABLE;
         goto epilogue;
     }
 
-    cfg = smmuv3_get_config(sdev, &event);
+    cfg = smmuv3_get_config(sdev, &event, is_secure);
     if (!cfg) {
         status = SMMU_TRANS_ERROR;
         goto epilogue;
@@ -1167,7 +1220,7 @@ epilogue:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s translation failed for iova=0x%"PRIx64" (%s)\n",
                       mr->parent_obj.name, addr, smmu_event_string(event.type));
-        smmuv3_record_event(s, &event, false);
+        smmuv3_record_event(s, &event, cfg->secure);
         break;
     }
 
@@ -1186,16 +1239,18 @@ epilogue:
  * @tg: translation granule (if communicated through range invalidation)
  * @num_pages: number of @granule sized pages (if tg != 0), otherwise 1
  * @stage: Which stage(1 or 2) is used
+ * @is_secure: true if the translation is for a secure domain
  */
 static void smmuv3_notify_iova(IOMMUMemoryRegion *mr,
                                IOMMUNotifier *n,
                                int asid, int vmid,
                                dma_addr_t iova, uint8_t tg,
-                               uint64_t num_pages, int stage)
+                               uint64_t num_pages, int stage,
+                               bool is_secure)
 {
     SMMUDevice *sdev = container_of(mr, SMMUDevice, iommu);
     SMMUEventInfo eventinfo = {.inval_ste_allowed = true};
-    SMMUTransCfg *cfg = smmuv3_get_config(sdev, &eventinfo);
+    SMMUTransCfg *cfg = smmuv3_get_config(sdev, &eventinfo, is_secure);
     IOMMUTLBEvent event;
     uint8_t granule;
 
@@ -1251,7 +1306,8 @@ static void smmuv3_notify_iova(IOMMUMemoryRegion *mr,
 /* invalidate an asid/vmid/iova range tuple in all mr's */
 static void smmuv3_inv_notifiers_iova(SMMUState *s, int asid, int vmid,
                                       dma_addr_t iova, uint8_t tg,
-                                      uint64_t num_pages, int stage)
+                                      uint64_t num_pages, int stage,
+                                      bool is_secure)
 {
     SMMUDevice *sdev;
 
@@ -1263,12 +1319,14 @@ static void smmuv3_inv_notifiers_iova(SMMUState *s, int asid, int vmid,
                                         iova, tg, num_pages, stage);
 
         IOMMU_NOTIFIER_FOREACH(n, mr) {
-            smmuv3_notify_iova(mr, n, asid, vmid, iova, tg, num_pages, stage);
+            smmuv3_notify_iova(mr, n, asid, vmid, iova, tg,
+                               num_pages, stage, is_secure);
         }
     }
 }
 
-static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage)
+static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage,
+                               bool is_secure)
 {
     dma_addr_t end, addr = CMD_ADDR(cmd);
     uint8_t type = CMD_TYPE(cmd);
@@ -1284,7 +1342,8 @@ static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage)
     SMMUv3State *smmuv3 = ARM_SMMUV3(s);
 
     /* Only consider VMID if stage-2 is supported. */
-    if (STAGE2_SUPPORTED(smmuv3)) {
+    if (STAGE2_SUPPORTED(smmuv3) ||
+        (SECURE_IMPLEMENTED(smmuv3) && SECURE_S2_SUPPORTED(smmuv3))) {
         vmid = CMD_VMID(cmd);
     }
 
@@ -1294,7 +1353,7 @@ static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage)
 
     if (!tg) {
         trace_smmuv3_range_inval(vmid, asid, addr, tg, 1, ttl, leaf, stage);
-        smmuv3_inv_notifiers_iova(s, asid, vmid, addr, tg, 1, stage);
+        smmuv3_inv_notifiers_iova(s, asid, vmid, addr, tg, 1, stage, is_secure);
         if (stage == SMMU_STAGE_1) {
             smmu_iotlb_inv_iova(s, asid, vmid, addr, tg, 1, ttl);
         } else {
@@ -1317,7 +1376,8 @@ static void smmuv3_range_inval(SMMUState *s, Cmd *cmd, SMMUStage stage)
         num_pages = (mask + 1) >> granule;
         trace_smmuv3_range_inval(vmid, asid, addr, tg, num_pages,
                                  ttl, leaf, stage);
-        smmuv3_inv_notifiers_iova(s, asid, vmid, addr, tg, num_pages, stage);
+        smmuv3_inv_notifiers_iova(s, asid, vmid, addr, tg,
+                                  num_pages, stage, is_secure);
         if (stage == SMMU_STAGE_1) {
             smmu_iotlb_inv_iova(s, asid, vmid, addr, tg, num_pages, ttl);
         } else {
@@ -1461,7 +1521,8 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
              * VMID is only matched when stage 2 is supported, otherwise set it
              * to -1 as the value used for stage-1 only VMIDs.
              */
-            if (STAGE2_SUPPORTED(s)) {
+            if (STAGE2_SUPPORTED(s) ||
+                (SECURE_IMPLEMENTED(s) && SECURE_S2_SUPPORTED(s))) {
                 vmid = CMD_VMID(&cmd);
             }
 
@@ -1483,7 +1544,8 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
              * If stage-2 is supported, invalidate for this VMID only, otherwise
              * invalidate the whole thing.
              */
-            if (STAGE2_SUPPORTED(s)) {
+            if (STAGE2_SUPPORTED(s) ||
+                (SECURE_IMPLEMENTED(s) && SECURE_S2_SUPPORTED(s))) {
                 vmid = CMD_VMID(&cmd);
                 trace_smmuv3_cmdq_tlbi_nh(vmid);
                 smmu_iotlb_inv_vmid_s1(bs, vmid);
@@ -1502,7 +1564,7 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
                 cmd_error = SMMU_CERROR_ILL;
                 break;
             }
-            smmuv3_range_inval(bs, &cmd, SMMU_STAGE_1);
+            smmuv3_range_inval(bs, &cmd, SMMU_STAGE_1, false);
             break;
         case SMMU_CMD_TLBI_S12_VMALL:
         {
@@ -1527,7 +1589,7 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
              * As currently only either s1 or s2 are supported
              * we can reuse same function for s2.
              */
-            smmuv3_range_inval(bs, &cmd, SMMU_STAGE_2);
+            smmuv3_range_inval(bs, &cmd, SMMU_STAGE_2, false);
             break;
         case SMMU_CMD_TLBI_EL3_ALL:
         case SMMU_CMD_TLBI_EL3_VA:
