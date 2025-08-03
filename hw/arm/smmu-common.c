@@ -332,13 +332,16 @@ void smmu_iotlb_inv_vmid_s1(SMMUState *s, int vmid)
  * @base_addr[@index]
  */
 static int get_pte(dma_addr_t baseaddr, uint32_t index, uint64_t *pte,
-                   SMMUPTWEventInfo *info)
+                   SMMUPTWEventInfo *info, bool is_secure)
 {
     int ret;
     dma_addr_t addr = baseaddr + index * sizeof(*pte);
+    MemTxAttrs attrs = is_secure ?
+        (MemTxAttrs) { .secure = 1 } :
+        (MemTxAttrs) { .unspecified = true };
 
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = ldq_le_dma(&address_space_memory, addr, pte, MEMTXATTRS_UNSPECIFIED);
+    ret = ldq_le_dma(&address_space_memory, addr, pte, attrs);
 
     if (ret != MEMTX_OK) {
         info->type = SMMU_PTW_ERR_WALK_EABT;
@@ -485,7 +488,7 @@ static int smmu_ptw_64_s1(SMMUState *bs, SMMUTransCfg *cfg,
         dma_addr_t pte_addr = baseaddr + offset * sizeof(pte);
         uint8_t ap;
 
-        if (get_pte(baseaddr, offset, &pte, info)) {
+        if (get_pte(baseaddr, offset, &pte, info, cfg->secure)) {
                 goto error;
         }
         trace_smmu_ptw_level(stage, level, iova, subpage_size,
@@ -621,7 +624,7 @@ static int smmu_ptw_64_s2(SMMUTransCfg *cfg,
         dma_addr_t pte_addr = baseaddr + offset * sizeof(pte);
         uint8_t s2ap;
 
-        if (get_pte(baseaddr, offset, &pte, info)) {
+        if (get_pte(baseaddr, offset, &pte, info, cfg->secure)) {
                 goto error;
         }
         trace_smmu_ptw_level(stage, level, ipa, subpage_size,
