@@ -128,8 +128,8 @@ static inline MemTxResult queue_read(SMMUQueue *q, Cmd *cmd, bool is_secure)
         (MemTxAttrs) { .secure = 1 } :
         (MemTxAttrs) { .unspecified = true };
 
-    ret = dma_memory_read(&address_space_memory, addr, cmd, sizeof(Cmd),
-                          attrs);
+    ret = dma_memory_read(smmu_get_address_space(is_secure), addr, cmd,
+                          sizeof(Cmd), attrs);
     if (ret != MEMTX_OK) {
         return ret;
     }
@@ -152,8 +152,8 @@ static MemTxResult queue_write(SMMUQueue *q, Evt *evt_in, bool is_secure)
     for (i = 0; i < ARRAY_SIZE(evt.word); i++) {
         cpu_to_le32s(&evt.word[i]);
     }
-    ret = dma_memory_write(&address_space_memory, addr, &evt, sizeof(Evt),
-                           attrs);
+    ret = dma_memory_write(smmu_get_address_space(is_secure), addr, &evt,
+                           sizeof(Evt), attrs);
     if (ret != MEMTX_OK) {
         return ret;
     }
@@ -360,8 +360,8 @@ static int smmu_get_ste(SMMUv3State *s, dma_addr_t addr, STE *buf,
 
     trace_smmuv3_get_ste(addr);
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
-                          attrs);
+    ret = dma_memory_read(smmu_get_address_space(attrs.secure), addr, buf,
+                          sizeof(*buf), attrs);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -409,8 +409,8 @@ static int smmu_get_cd(SMMUv3State *s, STE *ste, SMMUTransCfg *cfg,
     }
 
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
-                          attrs);
+    ret = dma_memory_read(smmu_get_address_space(cfg->secure), addr, buf,
+                          sizeof(*buf), attrs);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -740,8 +740,8 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
         l2_ste_offset = sid & ((1 << sid_split) - 1);
         l1ptr = (dma_addr_t)(strtab_base + l1_ste_offset * sizeof(l1std));
         /* TODO: guarantee 64-bit single-copy atomicity */
-        ret = dma_memory_read(&address_space_memory, l1ptr, &l1std,
-                              sizeof(l1std), attrs);
+        ret = dma_memory_read(smmu_get_address_space(is_secure), l1ptr,
+                              &l1std, sizeof(l1std), attrs);
         if (ret != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "Could not read L1PTR at 0X%"PRIx64"\n", l1ptr);
@@ -1143,7 +1143,7 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     SMMUTranslationStatus status;
     SMMUTransCfg *cfg = NULL;
     IOMMUTLBEntry entry = {
-        .target_as = &address_space_memory,
+        .target_as = smmu_get_address_space(false),
         .iova = addr,
         .translated_addr = addr,
         .addr_mask = ~(hwaddr)0,
@@ -1295,7 +1295,7 @@ static void smmuv3_notify_iova(IOMMUMemoryRegion *mr,
     }
 
     event.type = IOMMU_NOTIFIER_UNMAP;
-    event.entry.target_as = &address_space_memory;
+    event.entry.target_as = smmu_get_address_space(is_secure);
     event.entry.iova = iova;
     event.entry.addr_mask = num_pages * (1 << granule) - 1;
     event.entry.perm = IOMMU_NONE;
