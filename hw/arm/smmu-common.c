@@ -29,6 +29,14 @@
 #include "hw/arm/smmu-common.h"
 #include "smmu-internal.h"
 
+/* Global state for secure address space availability */
+bool arm_secure_as_available;
+
+void smmu_enable_secure_address_space(void)
+{
+    arm_secure_as_available = true;
+}
+
 /* IOTLB Management */
 
 static guint smmu_iotlb_key_hash(gconstpointer v)
@@ -341,7 +349,7 @@ static int get_pte(dma_addr_t baseaddr, uint32_t index, uint64_t *pte,
         (MemTxAttrs) { .unspecified = true };
 
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = ldq_le_dma(&address_space_memory, addr, pte, attrs);
+    ret = ldq_le_dma(smmu_get_address_space(is_secure), addr, pte, attrs);
 
     if (ret != MEMTX_OK) {
         info->type = SMMU_PTW_ERR_WALK_EABT;
