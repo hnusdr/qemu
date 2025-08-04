@@ -23,6 +23,19 @@
 #include "hw/pci/pci.h"
 #include "qom/object.h"
 
+extern AddressSpace __attribute__((weak)) arm_secure_address_space;
+extern bool arm_secure_as_available;
+
+void smmu_enable_secure_address_space(void);
+
+static inline AddressSpace *smmu_get_address_space(bool is_secure)
+{
+    if (is_secure && arm_secure_as_available) {
+        return &arm_secure_address_space;
+    }
+    return &address_space_memory;
+}
+
 #define SMMU_PCI_BUS_MAX                    256
 #define SMMU_PCI_DEVFN_MAX                  256
 #define SMMU_PCI_DEVFN(sid)                 (sid & 0xFF)
