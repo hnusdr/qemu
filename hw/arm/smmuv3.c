@@ -1591,6 +1591,26 @@ static int smmuv3_cmdq_consume(SMMUv3State *s, bool is_secure)
              */
             smmuv3_range_inval(bs, &cmd, SMMU_STAGE_2, false);
             break;
+        case SMMU_CMD_TLBI_S_S2_IPA:
+            if (!is_secure || !STAGE2_SUPPORTED(s) ||
+                    (SECURE_IMPLEMENTED(s) && SECURE_S2_SUPPORTED(s))) {
+                cmd_error = SMMU_CERROR_ILL;
+                break;
+            }
+            smmuv3_range_inval(bs, &cmd, SMMU_STAGE_2, true);
+            break;
+        case SMMU_CMD_TLBI_S_S12_VMALL:
+            if (!is_secure || !STAGE2_SUPPORTED(s) ||
+                    (SECURE_IMPLEMENTED(s) && SECURE_S2_SUPPORTED(s))) {
+                cmd_error = SMMU_CERROR_ILL;
+                break;
+            }
+
+            int vmid = CMD_VMID(&cmd);
+            trace_smmuv3_cmdq_tlbi_s12_vmid(vmid);
+            smmu_inv_notifiers_all(&s->smmu_state);
+            smmu_iotlb_inv_vmid(bs, vmid);
+            break;
         case SMMU_CMD_TLBI_EL3_ALL:
         case SMMU_CMD_TLBI_EL3_VA:
         case SMMU_CMD_TLBI_EL2_ALL:

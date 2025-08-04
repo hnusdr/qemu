@@ -391,6 +391,8 @@ typedef enum SMMUCommandType {
     SMMU_CMD_RESUME          = 0x44,
     SMMU_CMD_STALL_TERM,
     SMMU_CMD_SYNC,
+    SMMU_CMD_TLBI_S_S12_VMALL  = 0x58,
+    SMMU_CMD_TLBI_S_S2_IPA     = 0x5a,
 } SMMUCommandType;
 
 static const char *cmd_stringify[] = {
@@ -419,6 +421,8 @@ static const char *cmd_stringify[] = {
     [SMMU_CMD_RESUME]          = "SMMU_CMD_RESUME",
     [SMMU_CMD_STALL_TERM]      = "SMMU_CMD_STALL_TERM",
     [SMMU_CMD_SYNC]            = "SMMU_CMD_SYNC",
+    [SMMU_CMD_TLBI_S_S12_VMALL] = "SMMU_CMD_TLBI_S_S12_VMALL",
+    [SMMU_CMD_TLBI_S_S2_IPA]   = "SMMU_CMD_TLBI_S_S2_IPA",
 };
 
 static inline const char *smmu_cmd_string(SMMUCommandType type)
