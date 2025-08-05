@@ -1137,6 +1137,33 @@ static void smmuv3_fixup_event(SMMUEventInfo *event, hwaddr iova)
     }
 }
 
+/*
+ * ARM SMMU IOMMU index mapping (implements SEC_SID from ARM SMMU):
+ * iommu_idx = 0: Non-secure transactions
+ * iommu_idx = 1: Secure transactions
+ *
+ * The iommu_idx parameter effectively implements the SEC_SID
+ * (Security Stream ID) attribute from the ARM SMMU architecture
+ * specification, which allows the SMMU to differentiate between
+ * secure and non-secure transactions at the hardware level.
+ */
+static int smmuv3_attrs_to_index(IOMMUMemoryRegion *iommu, MemTxAttrs attrs)
+{
+    /*
+     * Map transaction attributes to IOMMU index:
+     * - Secure transactions (attrs.secure = 1) -> iommu_idx = 1
+     * - Non-secure transactions (attrs.secure = 0) -> iommu_idx = 0
+     * - Unspecified attributes are treated as non-secure for compat
+     */
+    return attrs.secure ? 1 : 0;
+}
+
+static int smmuv3_num_indexes(IOMMUMemoryRegion *iommu)
+{
+    /* ARM SMMU supports 2 IOMMU indexes: non-secure (0) and secure (1) */
+    return 2;
+}
+
 /* Entry point to SMMU, does everything. */
 static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
                                       IOMMUAccessFlags flag, int iommu_idx)
@@ -1149,16 +1176,15 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
                            .inval_ste_allowed = false};
     SMMUTranslationStatus status;
     SMMUTransCfg *cfg = NULL;
+    bool is_secure = (iommu_idx == 1);
     IOMMUTLBEntry entry = {
-        .target_as = smmu_get_address_space(false),
+        .target_as = smmu_get_address_space(is_secure),
         .iova = addr,
         .translated_addr = addr,
         .addr_mask = ~(hwaddr)0,
         .perm = IOMMU_NONE,
     };
     SMMUTLBEntry *cached_entry = NULL;
-    /* We don't support secure translation for now */
-    bool is_secure = false;
 
     qemu_mutex_lock(&s->mutex);
 
@@ -2639,6 +2665,8 @@ static void smmuv3_iommu_memory_region_class_init(ObjectClass *klass,
 
     imrc->translate = smmuv3_translate;
     imrc->notify_flag_changed = smmuv3_notify_flag_changed;
+    imrc->attrs_to_index = smmuv3_attrs_to_index;
+    imrc->num_indexes = smmuv3_num_indexes;
 }
 
 static const TypeInfo smmuv3_type_info = {
