@@ -953,8 +953,9 @@ static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event,
     SMMUv3State *s = sdev->smmu;
     SMMUState *bc = &s->smmu_state;
     SMMUTransCfg *cfg;
+    SMMUConfigKey lookup_key = smmu_get_config_key(sdev, is_secure);
 
-    cfg = g_hash_table_lookup(bc->configs, sdev);
+    cfg = g_hash_table_lookup(bc->configs, &lookup_key);
     if (cfg) {
         sdev->cfg_cache_hits++;
         trace_smmuv3_config_cache_hit(smmu_get_sid(sdev),
@@ -971,7 +972,9 @@ static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event,
         cfg->secure = is_secure;
 
         if (!smmuv3_decode_config(&sdev->iommu, cfg, event)) {
-            g_hash_table_insert(bc->configs, sdev, cfg);
+            SMMUConfigKey *persistent_key = g_new(SMMUConfigKey, 1);
+            *persistent_key = smmu_get_config_key(sdev, is_secure);
+            g_hash_table_insert(bc->configs, persistent_key, cfg);
         } else {
             g_free(cfg);
             cfg = NULL;
@@ -984,9 +987,13 @@ static void smmuv3_flush_config(SMMUDevice *sdev)
 {
     SMMUv3State *s = sdev->smmu;
     SMMUState *bc = &s->smmu_state;
+    SMMUConfigKey key_secure = smmu_get_config_key(sdev, true);
+    SMMUConfigKey key_nonsecure = smmu_get_config_key(sdev, false);
 
     trace_smmu_config_cache_inv(smmu_get_sid(sdev));
-    g_hash_table_remove(bc->configs, sdev);
+    /* Remove both secure and non-secure configurations for this device */
+    g_hash_table_remove(bc->configs, &key_secure);
+    g_hash_table_remove(bc->configs, &key_nonsecure);
 }
 
 static void smmuv3_invalidate_all_caches(SMMUv3State *s)
