@@ -40,6 +40,10 @@
                                         ((ptw_info).stage == SMMU_STAGE_2 && \
                                         (cfg)->s2cfg.record_faults))
 
+#if ENABLE_PLAT_DEV_SMMU
+SMMUState *g_smmuv3_state = NULL;
+#endif
+
 /**
  * smmuv3_trigger_irq - pulse @irq if enabled and update
  * GERROR register in case of GERROR interrupt
@@ -2506,6 +2510,9 @@ static void smmu_realize(DeviceState *d, Error **errp)
 {
     SMMUState *sys = ARM_SMMU(d);
     SMMUv3State *s = ARM_SMMUV3(sys);
+#if ENABLE_PLAT_DEV_SMMU
+    g_smmuv3_state = sys;
+#endif
     SMMUv3Class *c = ARM_SMMUV3_GET_CLASS(s);
     SysBusDevice *dev = SYS_BUS_DEVICE(d);
     Error *local_err = NULL;
@@ -2518,8 +2525,13 @@ static void smmu_realize(DeviceState *d, Error **errp)
 
     qemu_mutex_init(&s->mutex);
 
+#if ENABLE_PLAT_DEV_SMMU
+    memory_region_init_io(&sys->iomem, OBJECT(s),
+                          &smmu_mem_ops, sys, TYPE_ARM_SMMUV3, 0x10000);
+#else
     memory_region_init_io(&sys->iomem, OBJECT(s),
                           &smmu_mem_ops, sys, TYPE_ARM_SMMUV3, 0x20000);
+#endif
 
     sys->mrtypename = TYPE_SMMUV3_IOMMU_MEMORY_REGION;
 

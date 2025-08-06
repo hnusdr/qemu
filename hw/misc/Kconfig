@@ -235,4 +235,7 @@ config IOSB
 config XLNX_VERSAL_TRNG
     bool
 
+config SMMUV3_TEST
+    bool
+
 source macio/Kconfig
