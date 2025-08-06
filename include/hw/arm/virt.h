@@ -41,6 +41,8 @@
 #include "hw/intc/arm_gicv3_common.h"
 #include "qom/object.h"
 
+#define ENABLE_PLAT_DEV_SMMU 1
+
 #define NUM_GICV2M_SPIS       64
 #define NUM_VIRTIO_TRANSPORTS 32
 #define NUM_SMMU_IRQS          4
@@ -81,6 +83,9 @@ enum {
     VIRT_NVDIMM_ACPI,
     VIRT_PVTIME,
     VIRT_ACPI_PCIHP,
+#if ENABLE_PLAT_DEV_SMMU
+    VIRT_SMMUV3_TEST,
+#endif
     VIRT_LOWMEMMAP_LAST,
 };
 

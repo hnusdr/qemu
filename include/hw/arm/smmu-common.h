@@ -22,6 +22,7 @@
 #include "hw/sysbus.h"
 #include "hw/pci/pci.h"
 #include "qom/object.h"
+#include "hw/arm/virt.h"
 
 extern AddressSpace __attribute__((weak)) arm_secure_address_space;
 extern bool arm_secure_as_available;
@@ -202,7 +203,11 @@ SMMUPciBus *smmu_find_smmu_pcibus(SMMUState *s, uint8_t bus_num);
 /* Return the stream ID of an SMMU device */
 static inline uint16_t smmu_get_sid(SMMUDevice *sdev)
 {
+#if ENABLE_PLAT_DEV_SMMU
+    return 0 << 8 | sdev->devfn;
+#else
     return PCI_BUILD_BDF(pci_bus_num(sdev->bus), sdev->devfn);
+#endif
 }
 
 /**
@@ -248,5 +253,7 @@ void smmu_iotlb_inv_ipa(SMMUState *s, int vmid, dma_addr_t ipa, uint8_t tg,
 void smmu_configs_inv_sid_range(SMMUState *s, SMMUSIDRange sid_range);
 /* Unmap the range of all the notifiers registered to any IOMMU mr */
 void smmu_inv_notifiers_all(SMMUState *s);
-
+#if ENABLE_PLAT_DEV_SMMU
+AddressSpace *smmu_plat_dev_find_add_as(SMMUState *s, int sid);
+#endif
 #endif /* HW_ARM_SMMU_COMMON_H */

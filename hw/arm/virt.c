@@ -91,6 +91,7 @@
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_host.h"
 #include "qemu/guest-random.h"
+#include "hw/misc/smmuv3-test.h"
 
 AddressSpace arm_secure_address_space;
 
@@ -183,13 +184,20 @@ static const MemMapEntry base_memmap[] = {
     [VIRT_FW_CFG] =             { 0x09020000, 0x00000018 },
     [VIRT_GPIO] =               { 0x09030000, 0x00001000 },
     [VIRT_UART1] =              { 0x09040000, 0x00001000 },
+#if ENABLE_PLAT_DEV_SMMU
+    [VIRT_SMMU] =               { 0x09050000, 0x00010000 },
+#else
     [VIRT_SMMU] =               { 0x09050000, 0x00020000 },
+#endif
     [VIRT_PCDIMM_ACPI] =        { 0x09070000, MEMORY_HOTPLUG_IO_LEN },
     [VIRT_ACPI_GED] =           { 0x09080000, ACPI_GED_EVT_SEL_LEN },
     [VIRT_NVDIMM_ACPI] =        { 0x09090000, NVDIMM_ACPI_IO_LEN},
     [VIRT_PVTIME] =             { 0x090a0000, 0x00010000 },
     [VIRT_SECURE_GPIO] =        { 0x090b0000, 0x00001000 },
     [VIRT_ACPI_PCIHP] =         { 0x090c0000, ACPI_PCIHP_SIZE },
+#if ENABLE_PLAT_DEV_SMMU
+    [VIRT_SMMUV3_TEST] =        { 0x09060000, 0x00001000 },
+#endif
     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
     [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
@@ -244,6 +252,9 @@ static const int a15irqmap[] = {
     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
+#if ENABLE_PLAT_DEV_SMMU
+    [VIRT_SMMUV3_TEST] = 80,
+#endif
     [VIRT_PLATFORM_BUS] = 112, /* ...to 112 + PLATFORM_BUS_NUM_IRQS -1 */
 };
 
@@ -1733,6 +1744,24 @@ static void create_secure_ram(VirtMachineState *vms,
     g_free(nodename);
 }
 
+#if ENABLE_PLAT_DEV_SMMU
+static void create_smmuv3_test(VirtMachineState *vms, int mm_index,
+                        MemoryRegion *mem)
+{
+    hwaddr base = vms->memmap[mm_index].base;
+    // hwaddr size = vms->memmap[mm_index].size;
+    int irq = vms->irqmap[mm_index];
+    DeviceState *dev = qdev_new(TYPE_SMMUV3_TEST);
+    // SMMUV3TestState *dc = SMMUV3_TEST(dev);
+    SysBusDevice *s = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion(mem, base,
+                                sysbus_mmio_get_region(s, 0));
+    sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, /* SPI interrupt no need minus 32 */ irq - 32));
+}
+#endif
+
 static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
 {
     const VirtMachineState *board = container_of(binfo, VirtMachineState,
@@ -2471,6 +2500,12 @@ static void machvirt_init(MachineState *machine)
 
     create_pcie(vms);
     create_cxl_host_reg_region(vms);
+
+#if ENABLE_PLAT_DEV_SMMU
+    if (vms->secure) {
+        create_smmuv3_test(vms, VIRT_SMMUV3_TEST, secure_sysmem);
+    }
+#endif
 
     if (has_ged && aarch64 && firmware_loaded && virt_is_acpi_enabled(vms)) {
         vms->acpi_dev = create_acpi_ged(vms);

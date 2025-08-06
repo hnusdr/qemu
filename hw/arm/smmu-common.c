@@ -56,6 +56,9 @@ SMMUConfigKey smmu_get_config_key(SMMUDevice *sdev, bool is_secure)
     SMMUConfigKey key = {.sdev = sdev, .is_secure = is_secure};
     return key;
 }
+#if ENABLE_PLAT_DEV_SMMU
+extern SMMUDevice *smmuv3_test_dev;
+#endif
 
 /* IOTLB Management */
 
@@ -885,6 +888,34 @@ SMMUPciBus *smmu_find_smmu_pcibus(SMMUState *s, uint8_t bus_num)
 
     return NULL;
 }
+
+#if ENABLE_PLAT_DEV_SMMU
+AddressSpace *smmu_plat_dev_find_add_as(SMMUState *s, int sid)
+{
+    SMMUDevice *sdev = NULL;
+    static unsigned int index;
+
+    if (!sdev) {
+        char *name = g_strdup_printf("%s-%d-%d", s->mrtypename, sid, index++);
+
+        sdev = g_new0(SMMUDevice, 1);
+
+        sdev->smmu = s;
+        sdev->bus = NULL;
+        sdev->devfn = sid;
+
+        memory_region_init_iommu(&sdev->iommu, sizeof(sdev->iommu),
+                                 s->mrtypename,
+                                 OBJECT(s), name, UINT64_MAX);
+        address_space_init(&sdev->as,
+                           MEMORY_REGION(&sdev->iommu), name);
+        trace_smmu_add_mr(name);
+        g_free(name);
+    }
+    smmuv3_test_dev = sdev;
+    return &sdev->as;
+}
+#endif
 
 static AddressSpace *smmu_find_add_as(PCIBus *bus, void *opaque, int devfn)
 {
