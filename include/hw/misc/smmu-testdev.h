@@ -29,6 +29,7 @@ typedef enum SMMUTestDevSpace {
 enum {
     STD_REG_ID           = 0x00,
     STD_REG_ATTR_NS      = 0x04,
+    STD_REG_ATTR_S       = 0x08,
     STD_REG_SMMU_BASE_LO = 0x20,
     STD_REG_SMMU_BASE_HI = 0x24,
     STD_REG_DMA_IOVA_LO  = 0x28,
@@ -367,10 +368,14 @@ enum {
  * relative layout stays identical across spaces.
  */
 #define STD_SPACE_OFFS_NS       0x40000000ULL
+#define STD_SPACE_OFFS_S        0x00000000ULL
+#define STD_SPACE_OFFS_INVALID  0xffffffffULL
 
 static inline uint64_t std_space_offset(SMMUTestDevSpace sp)
 {
     switch (sp) {
+    case STD_SPACE_SECURE:
+        return STD_SPACE_OFFS_S;
     case STD_SPACE_NONSECURE:
         return STD_SPACE_OFFS_NS;
     default:
@@ -381,6 +386,8 @@ static inline uint64_t std_space_offset(SMMUTestDevSpace sp)
 static const char *std_space_to_str(SMMUTestDevSpace sp)
 {
     switch (sp) {
+    case STD_SPACE_SECURE:
+        return "Secure";
     case STD_SPACE_NONSECURE:
         return "Non-Secure";
     default:

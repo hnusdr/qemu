@@ -32,6 +32,7 @@ struct SMMUTestDevState {
     PCIDevice parent_obj;
     MemoryRegion bar0;
     uint32_t attr_ns;     /* Track Non-Secure for now; reserve room for more. */
+    uint32_t attr_s;
 
     uint64_t smmu_base;
     uint64_t dma_iova;
@@ -62,6 +63,7 @@ struct SMMUTestDevState {
 enum {
     REG_ID            = 0x00,
     REG_ATTR_NS       = 0x04,
+    REG_ATTR_S        = 0x08,
     REG_SMMU_BASE_LO  = 0x20,
     REG_SMMU_BASE_HI  = 0x24,
     REG_DMA_IOVA_LO   = 0x28,
@@ -274,32 +276,35 @@ smmu_testdev_debug(const SMMUTestDevState *s, const char *fmt, ...)
     }
 }
 
-/* Only support Non-Secure space for now. */
 static bool smmu_testdev_space_supported(SMMUTestDevSpace sp)
 {
-    return sp == STD_SPACE_NONSECURE;
+    return sp == STD_SPACE_NONSECURE || sp == STD_SPACE_SECURE;
 }
 
 static MemTxAttrs mk_attrs_from_space(SMMUTestDevSpace space)
 {
     MemTxAttrs a = {0};
-    if (!smmu_testdev_space_supported(space)) {
-        g_assert_not_reached();
-    } else {
-        a.space = space;
-    }
-    a.secure = 0;
+    a.space = space;
+    a.secure = arm_space_is_secure(space) ? 1 : 0;
     return a;
 }
 
 /* Convert SMMUTestDevSpace to AddressSpace */
 static inline AddressSpace *space_to_as(SMMUTestDevSpace sp)
 {
-    /* Future work can dispatch Secure/Realm/Root address spaces here. */
-    if (!smmu_testdev_space_supported(sp)) {
+    /* Future work can dispatch Realm/Root address spaces here. */
+    switch (sp) {
+    case STD_SPACE_SECURE:
+        if (arm_secure_as_available) {
+            return &arm_secure_address_space;
+        } else {
+            return NULL;
+        }
+    case STD_SPACE_NONSECURE:
+        return &address_space_memory;
+    default:
         g_assert_not_reached();
     }
-    return &address_space_memory;
 }
 
 /* Apply per-space offset for addresses or values that encode addresses. */
@@ -308,9 +313,9 @@ static inline uint64_t std_apply_space_offs(SMMUTestDevSpace sp, uint64_t x)
     return x + std_space_offset(sp);
 }
 
-/* Direct write helpers (no mirroring) */
+/* Direct write helpers */
 static void std_write64(SMMUTestDevSpace sp, uint64_t pa, uint64_t val,
-                       uint32_t *status)
+                        uint32_t *status)
 {
     MemTxAttrs a = mk_attrs_from_space(sp);
     AddressSpace *as = space_to_as(sp);
@@ -332,7 +337,7 @@ static void std_write32(SMMUTestDevSpace sp, uint64_t pa, uint32_t val,
     MemTxAttrs a = mk_attrs_from_space(sp);
     AddressSpace *as = space_to_as(sp);
     if (!as) {
-        *status = 0xdead2012u;
+        *status = 0xdead2011u;
         return;
     }
     MemTxResult r = address_space_write(as, pa, a, &val, sizeof(val));
@@ -422,10 +427,33 @@ static void smmu_testdev_build_translation(SMMUTestDevState *s)
         std_write32(build_space,
                     std_apply_space_offs(build_space, STD_STE_GPA) + i * 4,
                     ste.word[i], &st);
+        smmu_testdev_debug(s, "  ste[%d] = 0x%08x status: %d\n",
+                           i, ste.word[i], st);
         if (st != 0) {
             printf("Writing STE error! status: %x\n", st);
             return;
         }
+    }
+
+    if (s->trans_mode == TM_S2_ONLY && arm_space_is_secure(s->s2_space)) {
+        smmu_testdev_debug(s, "[smmu-testdev] STE @0x%llx\n",
+               (unsigned long long)STD_STE_GPA);
+        for (int i = 0; i < 8; i++) {
+            smmu_testdev_debug(s, "  ste[%d] = 0x%08x\n", i, ste.word[i]);
+        }
+        smmu_testdev_debug(s, "[smmu-testdev] PTE chain:\n");
+        smmu_testdev_debug(s, "  L0: PA=0x%llx VAL=0x%llx\n",
+               (unsigned long long)STD_L0_ADDR,
+               (unsigned long long)STD_L0_VAL);
+        smmu_testdev_debug(s, "  L1: PA=0x%llx VAL=0x%llx\n",
+               (unsigned long long)STD_L1_ADDR,
+               (unsigned long long)STD_L1_VAL);
+        smmu_testdev_debug(s, "  L2: PA=0x%llx VAL=0x%llx\n",
+               (unsigned long long)STD_L2_ADDR,
+               (unsigned long long)STD_L2_VAL);
+        smmu_testdev_debug(s, "  L3: PA=0x%llx VAL=0x%llx\n",
+               (unsigned long long)STD_L3_ADDR,
+               (unsigned long long)STD_L3_VAL);
     }
 
     /* Build CD image for S1 path if needed */
@@ -470,6 +498,14 @@ static void smmu_testdev_build_translation(SMMUTestDevState *s)
 
         L3_val = std_apply_space_offs(build_space, STD_L3_S1_VAL);
         std_write64(build_space, L3_pa, L3_val, &st);
+
+        if (arm_space_is_secure(s->s1_space) && s->trans_mode == TM_S1_ONLY) {
+            smmu_testdev_debug(s, "[smmu-testdev] CD @0x%llx (S1-only, Secure)\n",
+                   (unsigned long long)STD_CD_GPA);
+            for (int i = 0; i < 8; i++) {
+                smmu_testdev_debug(s, "  cd[%d] = 0x%08x\n", i, cd.word[i]);
+            }
+        }
     }
 
     /* Nested extras: CD S2 tables, CD.TTB S2 tables, shared entries. */
@@ -533,7 +569,7 @@ static void push_cfgi_cmd(SMMUTestDevState *s,
 {
     MemTxResult res = 0;
     g_assert(smmu_testdev_space_supported(bank_sp));
-    g_assert(!ssec);
+    // g_assert(!ssec);
     hwaddr bank_off = 0;
     uint32_t base_lo = address_space_ldl_le(&address_space_memory,
                                             s->smmu_base + bank_off + 0x90,
@@ -557,9 +593,9 @@ static void push_cfgi_cmd(SMMUTestDevState *s,
 
     /* push command to the command queue */
     MemTxAttrs a = mk_attrs_from_space(bank_sp);
-    AddressSpace *as = space_to_as(bank_sp);
+    AddressSpace* as = space_to_as(bank_sp);
     if (!as) {
-        printf("push_cfgi_cmd: space %d not supported\n", bank_sp);
+        smmu_testdev_debug(s, "push_cfgi_cmd: space not supported\n");
         return;
     }
     int ret = address_space_write(as, entry_pa, a,
@@ -578,7 +614,8 @@ static void push_cfgi_cmd(SMMUTestDevState *s,
 static void smmu_testdev_clear_caches(SMMUTestDevState *s)
 {
     uint32_t st = 0;
-    static const SMMUTestDevSpace spaces[] = { STD_SPACE_NONSECURE };
+    static const SMMUTestDevSpace spaces[] = { STD_SPACE_NONSECURE,
+                                               STD_SPACE_SECURE };
 
     for (size_t idx = 0; idx < ARRAY_SIZE(spaces); idx++) {
         SMMUTestDevSpace build_space = spaces[idx];
@@ -635,14 +672,32 @@ static void smmu_testdev_clear_caches(SMMUTestDevState *s)
         push_cfgi_cmd(s, STD_SPACE_NONSECURE, STD_CMD_TLBI_NSNH_ALL,
                       sid, false);
 
-        /* Add Secure/Realm/Root invalidations here once those domains exist. */
+        /* Secure bank invalidations (SSEC=1) only when any stage is
+         * configured outside the Non-Secure space. */
+        if (s->s1_space != STD_SPACE_NONSECURE ||
+            s->s2_space != STD_SPACE_NONSECURE) {
+            push_cfgi_cmd(s, STD_SPACE_SECURE, STD_CMD_CFGI_STE, sid, true);
+            push_cfgi_cmd(s, STD_SPACE_SECURE, STD_CMD_CFGI_CD,  sid, true);
+        }
+
     }
+}
+
+static uint32_t smmu_testdev_pack_attrs(MemTxAttrs attrs)
+{
+    uint32_t word = attrs.secure ? 1u : 0u;
+    word |= ((uint32_t)attrs.space & 0x3u) << 1;
+    word |= attrs.unspecified ? (1u << 3) : 0u;
+    return word;
 }
 
 static void smmu_testdev_refresh_attrs(SMMUTestDevState *s)
 {
-    /* Report the baked-in Non-Secure attributes until more exist. */
-    s->attr_ns = (STD_SPACE_NONSECURE << 1);
+    MemTxAttrs ns = smmu_get_txattrs(SMMU_SEC_SID_NS);
+    MemTxAttrs se = smmu_get_txattrs(SMMU_SEC_SID_S);
+
+    s->attr_ns = smmu_testdev_pack_attrs(ns);
+    s->attr_s = smmu_testdev_pack_attrs(se);
 }
 
 /* Trigger a DMA operation */
@@ -723,6 +778,8 @@ static uint64_t smmu_testdev_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return 0x53544d4du; /* 'STMM' */
     case REG_ATTR_NS:
         return s->attr_ns;
+    case REG_ATTR_S:
+        return s->attr_s;
     case REG_SMMU_BASE_LO:
         return (uint32_t)(s->smmu_base & 0xffffffffu);
     case REG_SMMU_BASE_HI:
@@ -896,6 +953,7 @@ static void smmu_testdev_reset(DeviceState *dev)
 static const Property smmu_testdev_properties[] = {
     DEFINE_PROP_UINT32("device", SMMUTestDevState, cfg_dev, 0),
     DEFINE_PROP_UINT32("function", SMMUTestDevState, cfg_fn, 1),
+    // TODO:  如何方便的传入debug-log
     DEFINE_PROP_BOOL("debug-log", SMMUTestDevState, debug_log, false),
 };
 

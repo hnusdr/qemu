@@ -19,30 +19,57 @@
 #include "hw/pci/pci_regs.h"
 #include "hw/misc/smmu-testdev.h"
 
+///// only for test
+#define DEBUG_SMMU_TESTDEV 1
+
 #define VIRT_SMMU_BASE    0x0000000009050000ULL
 #define DMA_LEN           0x20U
 
-static inline uint64_t smmu_bank_base(uint64_t base, SMMUTestDevSpace sp)
+/* Security space helpers (0=S,1=NS,2=Root,3=Realm). */
+static inline bool space_is_secure(uint32_t sp)
 {
-    /* Map only the Non-Secure bank for now; future domains may offset. */
-    (void)sp;
-    return base;
+    /* Future: refine for Realm/Root if they diverge. */
+    return sp == 0u;
+}
+
+/* SMMU bank offset: secure bank at +0x8000, NS at +0x0. */
+static inline uint64_t smmu_bank_base(uint64_t base, uint32_t sp)
+{
+    /* Only support the NS/Secure bank for now; future domains may offset. */
+    return base + (space_is_secure(sp) ? 0x8000ull : 0x0ull);
 }
 
 static uint32_t expected_dma_result(uint32_t mode,
                                     SMMUTestDevSpace s1_space,
                                     SMMUTestDevSpace s2_space)
 {
-    (void)mode;
-    if (s1_space != STD_SPACE_NONSECURE || s2_space != STD_SPACE_NONSECURE) {
+    // (void)mode;
+    // if (s1_space != STD_SPACE_NONSECURE || s2_space != STD_SPACE_NONSECURE) {
+    //     return STD_DMA_ERR_TX_FAIL;
+    // }
+    // return 0u;
+
+    /*
+     * For single-stage modes, only the active stage matters:
+     * - mode=0 (S1 only): consider s1_space
+     * - mode=1 (S2 only): consider s2_space
+     * For nested (mode=2), both S1 and S2 matter.
+     * Current model treats Secure as unsupported for data DMA.
+     */
+    if (mode == 1u) {
+        return (s2_space == STD_SPACE_SECURE) ? STD_DMA_ERR_TX_FAIL : 0u;
+    }
+    /* Nested: fail if stage2 is Secure. */
+    if (mode == 2u && s2_space == 0u) {
         return STD_DMA_ERR_TX_FAIL;
     }
     return 0u;
+
 }
 
 static void smmu_prog_bank(QTestState *qts, uint64_t B, SMMUTestDevSpace sp)
 {
-    g_assert_cmpuint(sp, ==, STD_SPACE_NONSECURE);
+    // g_assert_cmpuint(sp, ==, STD_SPACE_NONSECURE);
     /* Program minimal SMMUv3 state in a given control bank. */
     qtest_writel(qts, B + 0x0044, 0x80000000); /* GBPA UPDATE */
     qtest_writel(qts, B + 0x0020, 0x0);       /* CR0 */
@@ -110,7 +137,13 @@ static void test_mmio_access(void)
     QPCIBar bar;
     uint8_t buf[DMA_LEN];
     uint32_t attr_ns;
-    qts = qtest_init("-machine virt,acpi=off,gic-version=3,iommu=smmuv3 "
+    qts = qtest_init("-machine virt,acpi=off,gic-version=3,iommu=smmuv3,"
+                     "secure=on -global arm-smmuv3.secure-impl=true "
+#if DEBUG_SMMU_TESTDEV
+                    "-trace events=/mnt/sda1/OP-TEE/optee-qemu/qemu/smmu-events.txt "
+                    "-d guest_errors,unimp,invalid_mem,mmu,in_asm -D /mnt/nvme1n1/tt/code/qemu/qemu.log "
+                    "-global smmu-testdev.debug-log=true "
+#endif
                      "-display none -smp 1  -m 512 -cpu max -net none "
                     "-trace events=/mnt/sda1/OP-TEE/optee-qemu/qemu/smmu-events.txt "
                     "-d guest_errors,unimp,invalid_mem,mmu,in_asm -D /mnt/nvme1n1/tt/code/qemu/qemu.log "
@@ -165,8 +198,9 @@ static void test_mmio_access(void)
      * invoke translation builder for multiple
      * stage/security-space combinations (readable/refactored).
      */
-    const uint32_t modes[] = { 0u, 1u, 2u }; /* Stage1, Stage2, Nested stage */
-    const SMMUTestDevSpace spaces[] = { STD_SPACE_NONSECURE };
+    const uint32_t modes[] = { 0, 1, 2 };
+    const SMMUTestDevSpace spaces[] = { STD_SPACE_NONSECURE, STD_SPACE_SECURE };
+    const uint32_t ns_only[] = { 1u };
     /* Use attrs-DMA path for end-to-end */
     qpci_io_writel(dev, bar, STD_REG_DMA_MODE, 1);
     for (size_t mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
@@ -176,9 +210,19 @@ static void test_mmio_access(void)
         size_t s2_count = 0;
 
         switch (modes[mi]) {
-        case 0u:
-        case 1u:
-        case 2u:
+        case 0u: /* S1-only: vary stage-1 space, keep stage-2 Non-Secure */
+            s1_set = spaces;
+            s1_count = sizeof(spaces) / sizeof(spaces[0]);
+            s2_set = ns_only;
+            s2_count = sizeof(ns_only) / sizeof(ns_only[0]);
+            break;
+        case 1u: /* S2-only: vary stage-2 space, keep stage-1 Non-Secure */
+            s1_set = ns_only;
+            s1_count = sizeof(ns_only) / sizeof(ns_only[0]);
+            s2_set = spaces;
+            s2_count = sizeof(spaces) / sizeof(spaces[0]);
+            break;
+        case 2u: /* Nested: consider combinations for both stages */
             s1_set = spaces;
             s1_count = sizeof(spaces) / sizeof(spaces[0]);
             s2_set = spaces;
@@ -198,10 +242,11 @@ static void test_mmio_access(void)
 
                 uint32_t st = qpci_io_readl(dev, bar,
                                             STD_REG_TRANS_STATUS);
-                g_test_message("build: stage=%s s1=%s s2=%s status=0x%x",
+                g_test_message("\nbuild: stage=%s s1=%s s2=%s status=0x%x",
                                 std_mode_to_str(modes[mi]),
                                 std_space_to_str(s1_set[si]),
                                 std_space_to_str(s2_set[sj]), st);
+
                 /* Program SMMU registers in selected control bank. */
                 smmu_prog_minimal(qts, s1_set[si]);
 
@@ -224,7 +269,7 @@ static void test_mmio_access(void)
                 }
                 /* Clear CD/STE/PTE built by the device for next round. */
                 qpci_io_writel(dev, bar, STD_REG_TRANS_CLEAR, 1);
-                g_test_message("clear cache end.");
+                g_test_message("clear cache end.\n#################\n");
             }
         }
     }
