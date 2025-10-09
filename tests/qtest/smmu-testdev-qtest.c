@@ -110,8 +110,10 @@ static void test_mmio_access(void)
     QPCIBar bar;
     uint8_t buf[DMA_LEN];
     uint32_t attr_ns;
-    qts = qtest_init("-machine virt,acpi=off,gic-version=3,iommu=smmuv3 " \
+    qts = qtest_init("-machine virt,acpi=off,gic-version=3,iommu=smmuv3 "
                      "-display none -smp 1  -m 512 -cpu max -net none "
+                    "-trace events=/mnt/sda1/OP-TEE/optee-qemu/qemu/smmu-events.txt "
+                    "-d guest_errors,unimp,invalid_mem,mmu,in_asm -D /mnt/nvme1n1/tt/code/qemu/qemu.log "
                      "-device smmu-testdev,device=0x0,function=0x1 ");
 
     qpci_init_generic(&gbus, qts, NULL, false);
