@@ -449,8 +449,8 @@ static void smmu_testdev_build_translation(SMMUTestDevState *s)
         STD_CD_SET_TSZ(&cd, 0, 0x10);
         STD_CD_SET_TG(&cd, 0, 0x0);
         STD_CD_SET_ENDI(&cd, 0x0);
-        STD_CD_SET_NSCFG0(&cd, 0x0);
-        STD_CD_SET_NSCFG1(&cd, 0x0);
+        STD_CD_SET_NSCFG0(&cd, 0x1);
+        STD_CD_SET_NSCFG1(&cd, 0x1);
         STD_CD_SET_R(&cd, 0x1);
 
         /*
