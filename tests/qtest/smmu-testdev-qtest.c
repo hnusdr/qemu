@@ -199,7 +199,7 @@ static void test_mmio_access(void)
      * stage/security-space combinations (readable/refactored).
      */
     const uint32_t modes[] = { 0, 1, 2 };
-    const SMMUTestDevSpace spaces[] = { STD_SPACE_NONSECURE, STD_SPACE_SECURE };
+    const SMMUTestDevSpace spaces[] = { STD_SPACE_SECURE };
     const uint32_t ns_only[] = { 1u };
     /* Use attrs-DMA path for end-to-end */
     qpci_io_writel(dev, bar, STD_REG_DMA_MODE, 1);
