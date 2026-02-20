@@ -73,18 +73,21 @@
  * Address-space base offsets for test tables.
  * - Non-Secure uses a fixed offset, keeping internal layout identical.
  *
- * Note: Future spaces (e.g. Secure/Realm/Root) are not implemented here.
+ * Note: Future spaces (e.g. Realm/Root) are not implemented here.
  * When needed, introduce new offsets and reuse the helpers below so relative
  * layout stays identical across spaces.
  */
 #define QSMMU_SPACE_OFFS_NS             0x0000000040000000ull
+#define QSMMU_SPACE_OFFS_SECURE         0
 
 typedef enum QSMMUSecSID {
     QSMMU_SEC_SID_NONSECURE    = 0,
+    QSMMU_SEC_SID_SECURE       = 1,
 } QSMMUSecSID;
 
 typedef enum QSMMUSpace {
-    QSMMU_SPACE_NONSECURE      = 1,
+    QSMMU_SPACE_SECURE         = 0,  /* ARMSS_Secure */
+    QSMMU_SPACE_NONSECURE      = 1,  /* ARMSS_NonSecure */
 } QSMMUSpace;
 
 typedef enum QSMMUTransMode {
@@ -96,6 +99,7 @@ typedef enum QSMMUTransMode {
 typedef struct QSMMUTestConfig {
     QSMMUTransMode trans_mode;        /* Translation mode (S1, S2, Nested) */
     QSMMUSecSID sec_sid;              /* SEC_SID of test device */
+    QSMMUSpace tx_space;              /* Security space of transaction  */
     uint64_t dma_gpa;                 /* GPA for readback validation */
     uint32_t dma_len;                 /* DMA length for testing */
     uint32_t expected_result;         /* Expected DMA result for validation */
@@ -113,8 +117,11 @@ typedef struct QSMMUTestContext {
     QSMMUSpace tx_space;        /* Cached transaction space */
 } QSMMUTestContext;
 
-/* Convert SEC_SID to corresponding Security Space */
-QSMMUSpace qsmmu_sec_sid_to_space(QSMMUSecSID sec_sid);
+/* Return default SEC_SID used by iommu-testdev for a given tx space */
+QSMMUSecSID qsmmu_space_default_sec_sid(QSMMUSpace space);
+
+/* Convert SEC_SID enum to qdev property string */
+const char *qsmmu_sec_sid_to_qdev_prop(QSMMUSecSID sec_sid);
 
 /* Get base offset of the specific Security space */
 uint64_t qsmmu_space_offset(QSMMUSpace sp);
@@ -238,5 +245,21 @@ void qsmmu_setup_translation_tables(QTestState *qts,
 void qsmmu_run_translation_case(QTestState *qts, QPCIDevice *dev,
                                 QPCIBar bar, uint64_t smmu_base,
                                 const QSMMUTestConfig *cfg);
+
+/*
+ * Memory access wrappers that automatically select the correct qtest API
+ * based on security space. All wrappers use qtest_*_space() so that MemTxAttrs
+ * are always derived from the explicit transaction space.
+ */
+void qsmmu_writeq(QTestState *qts, uint64_t addr, uint64_t value,
+                  QSMMUSpace space);
+void qsmmu_writel(QTestState *qts, uint64_t addr, uint32_t value,
+                  QSMMUSpace space);
+uint64_t qsmmu_readq(QTestState *qts, uint64_t addr, QSMMUSpace space);
+uint32_t qsmmu_readl(QTestState *qts, uint64_t addr, QSMMUSpace space);
+void qsmmu_memset(QTestState *qts, uint64_t addr, uint8_t pattern,
+                  size_t size, QSMMUSpace space);
+void qsmmu_memread(QTestState *qts, uint64_t addr, void *data,
+                   size_t size, QSMMUSpace space);
 
 #endif /* QTEST_LIBQOS_SMMUV3_H */

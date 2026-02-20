@@ -14,11 +14,47 @@
 
 #include "qemu/osdep.h"
 #include "hw/arm/smmuv3-common.h"
+#include "hw/arm/arm-security.h"
 #include "tests/qtest/libqos/pci.h"
 #include "qos-iommu-testdev.h"
 #include "qos-smmuv3.h"
 
 #define QSMMU_STE_S2T0SZ_VAL 0x14
+
+/* Memory access wrappers based on ARM security space. */
+void qsmmu_writeq(QTestState *qts, uint64_t addr, uint64_t value,
+                  QSMMUSpace space)
+{
+    qtest_writeq_space(qts, addr, value, space);
+}
+
+void qsmmu_writel(QTestState *qts, uint64_t addr, uint32_t value,
+                  QSMMUSpace space)
+{
+    qtest_writel_space(qts, addr, value, space);
+}
+
+uint64_t qsmmu_readq(QTestState *qts, uint64_t addr, QSMMUSpace space)
+{
+    return qtest_readq_space(qts, addr, space);
+}
+
+uint32_t qsmmu_readl(QTestState *qts, uint64_t addr, QSMMUSpace space)
+{
+    return qtest_readl_space(qts, addr, space);
+}
+
+void qsmmu_memset(QTestState *qts, uint64_t addr, uint8_t pattern,
+                  size_t size, QSMMUSpace space)
+{
+    qtest_memset_space(qts, addr, pattern, size, space);
+}
+
+void qsmmu_memread(QTestState *qts, uint64_t addr, void *data,
+                   size_t size, QSMMUSpace space)
+{
+    qtest_memread_space(qts, addr, data, size, space);
+}
 
 /* Apply space offset to address */
 static inline uint64_t qsmmu_apply_space_offs(QSMMUSpace sp,
@@ -29,8 +65,8 @@ static inline uint64_t qsmmu_apply_space_offs(QSMMUSpace sp,
 
 uint32_t qsmmu_expected_dma_result(QSMMUTestContext *ctx)
 {
-    /* Currently only non-secure space is supported. */
-    if (ctx->tx_space != QSMMU_SPACE_NONSECURE) {
+    /* Currently only Non-secure/Secure space is supported. */
+    if (ctx->tx_space > QSMMU_SPACE_NONSECURE) {
         return ITD_DMA_ERR_TX_FAIL;
     }
     return ctx->config.expected_result;
@@ -39,16 +75,15 @@ uint32_t qsmmu_expected_dma_result(QSMMUTestContext *ctx)
 uint32_t qsmmu_build_dma_attrs(QSMMUSpace space)
 {
     uint32_t attrs = 0;
-    switch (space) {
-    case QSMMU_SPACE_NONSECURE:
-        /* Non-secure: secure=0, space=1, space_valid=1 */
-        attrs = ITD_ATTRS_SET_SECURE(attrs, 0);
-        attrs = ITD_ATTRS_SET_SPACE(attrs, QSMMU_SPACE_NONSECURE);
-        attrs = ITD_ATTRS_SET_SPACE_VALID(attrs, 1);
-        break;
-    default:
-        g_assert_not_reached();
-    }
+
+    /*
+     * Set secure bit based on ARM security space semantics:
+     * Secure(0) and Root(2) -> secure=1
+     * NonSecure(1) and Realm(3) -> secure=0
+     */
+    attrs = ITD_ATTRS_SET_SECURE(attrs, arm_space_is_secure(space) ? 1 : 0);
+    attrs = ITD_ATTRS_SET_SPACE(attrs, space);
+    attrs = ITD_ATTRS_SET_SPACE_VALID(attrs, 1);
 
     return attrs;
 }
@@ -83,11 +118,25 @@ static bool qsmmu_validate_test_result(QSMMUTestContext *ctx)
     return (ctx->dma_result == expected);
 }
 
-QSMMUSpace qsmmu_sec_sid_to_space(QSMMUSecSID sec_sid)
+QSMMUSecSID qsmmu_space_default_sec_sid(QSMMUSpace space)
+{
+    switch (space) {
+    case QSMMU_SPACE_SECURE:
+        return QSMMU_SEC_SID_SECURE;
+    case QSMMU_SPACE_NONSECURE:
+        return QSMMU_SEC_SID_NONSECURE;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+const char *qsmmu_sec_sid_to_qdev_prop(QSMMUSecSID sec_sid)
 {
     switch (sec_sid) {
     case QSMMU_SEC_SID_NONSECURE:
-        return QSMMU_SPACE_NONSECURE;
+        return "non-secure";
+    case QSMMU_SEC_SID_SECURE:
+        return "secure";
     default:
         g_assert_not_reached();
     }
@@ -98,6 +147,8 @@ uint64_t qsmmu_space_offset(QSMMUSpace sp)
     switch (sp) {
     case QSMMU_SPACE_NONSECURE:
         return QSMMU_SPACE_OFFS_NS;
+    case QSMMU_SPACE_SECURE:
+        return QSMMU_SPACE_OFFS_SECURE;
     default:
         g_assert_not_reached();
     }
@@ -145,7 +196,7 @@ void qsmmu_run_translation_case(QTestState *qts, QPCIDevice *dev,
         .smmu_base = smmu_base,
         .config = *cfg,
         .sid = dev->devfn,
-        .tx_space = qsmmu_sec_sid_to_space(cfg->sec_sid),
+        .tx_space = cfg->tx_space,
     };
 
     QOSIOMMUTestdevDmaCfg dma = {
@@ -156,7 +207,8 @@ void qsmmu_run_translation_case(QTestState *qts, QPCIDevice *dev,
         .len = ctx.config.dma_len,
     };
 
-    qtest_memset(qts, cfg->dma_gpa, 0x00, cfg->dma_len);
+    /* Clear DMA target memory using space-aware wrapper */
+    qsmmu_memset(qts, cfg->dma_gpa, 0x00, cfg->dma_len, ctx.tx_space);
     qos_iommu_testdev_single_translation(&dma, &ctx,
                                          qsmmu_single_translation_setup,
                                          qsmmu_single_translation_attrs,
@@ -168,7 +220,8 @@ void qsmmu_run_translation_case(QTestState *qts, QPCIDevice *dev,
         g_autofree uint8_t *buf = NULL;
 
         buf = g_malloc(ctx.config.dma_len);
-        qtest_memread(ctx.qts, ctx.config.dma_gpa, buf, ctx.config.dma_len);
+        qsmmu_memread(ctx.qts, ctx.config.dma_gpa, buf, ctx.config.dma_len,
+                      ctx.tx_space);
 
         for (int i = 0; i < ctx.config.dma_len; i++) {
             uint8_t expected;
@@ -191,7 +244,7 @@ uint32_t qsmmu_build_translation(QTestState *qts, QSMMUTransMode mode,
     CD cd;
 
     build_space = tx_space;
-    if (build_space != QSMMU_SPACE_NONSECURE) {
+    if (build_space > QSMMU_SPACE_NONSECURE) {
         return 0xdeadbeafu;
     }
 
@@ -236,15 +289,24 @@ uint32_t qsmmu_build_translation(QTestState *qts, QSMMUTransMode mode,
     ste_addr = sid * ste_cd_entry_bytes + QSMMU_STR_TAB_BASE;
     ste_addr_real = qsmmu_apply_space_offs(build_space, ste_addr);
 
-    /* Write STE to memory */
+    /* Write STE to memory using space-aware wrapper */
     for (int i = 0; i < ARRAY_SIZE(ste.word); i++) {
-        qtest_writel(qts, ste_addr_real + i * 4, ste.word[i]);
+        qsmmu_writel(qts, ste_addr_real + i * 4, ste.word[i], build_space);
     }
 
+    /*
+     * Set NSCFG based on security space:
+     * - NonSecure: nscfg=1 (Non-Secure output)
+     * - Secure: nscfg=0 (Secure output)
+     */
     switch (tx_space) {
     case QSMMU_SPACE_NONSECURE:
         nscfg0 = 0x1;
         nscfg1 = 0x1;
+        break;
+    case QSMMU_SPACE_SECURE:
+        nscfg0 = 0x0;
+        nscfg1 = 0x0;
         break;
     default:
         g_assert_not_reached();
@@ -276,10 +338,9 @@ uint32_t qsmmu_build_translation(QTestState *qts, QSMMUTransMode mode,
         CD_SET_TTB(&cd, 0, cd_ttb);
 
         for (int i = 0; i < ARRAY_SIZE(cd.word); i++) {
-            /* TODO: Maybe need more work to write to secure RAM in future */
-            qtest_writel(qts, cd_addr_real + i * 4, cd.word[i]);
-            g_assert_cmpint(qtest_readl(qts, cd_addr_real + i * 4), ==,
-                            cd.word[i]);
+            qsmmu_writel(qts, cd_addr_real + i * 4, cd.word[i], build_space);
+            g_assert_cmpint(qsmmu_readl(qts, cd_addr_real + i * 4, build_space),
+                            ==, cd.word[i]);
         }
     }
 
@@ -305,6 +366,8 @@ uint64_t qsmmu_bank_base(uint64_t base, QSMMUSpace sp)
     switch (sp) {
     case QSMMU_SPACE_NONSECURE:
         return base;
+    case QSMMU_SPACE_SECURE:
+        return SMMU_SECURE_REG_START + base;
     default:
         g_assert_not_reached();
     }
@@ -393,11 +456,15 @@ static uint64_t qsmmu_get_pte_attrs(QSMMUTransMode mode, bool is_leaf,
     uint64_t ro_mask = QSMMU_LEAF_PTE_RO_MASK;
     uint64_t non_leaf_mask = QSMMU_NON_LEAF_PTE_MASK;
 
-    switch (space) {
-    case QSMMU_SPACE_NONSECURE:
-        break;
-    default:
-        g_assert_not_reached();
+    /*
+     * Set table descriptor NSTable (bit63):
+     * - Secure     -> 0
+     * - NonSecure  -> 1
+     */
+    if (arm_space_is_secure(space)) {
+        non_leaf_mask &= ~BIT_ULL(63);
+        rw_mask &= ~BIT_ULL(5);
+        ro_mask &= ~BIT_ULL(5);
     }
 
     if (!is_leaf) {
@@ -449,15 +516,15 @@ static void qsmmu_setup_s2_walk_for_ipa(QTestState *qts,
 
     /* Stage 2 Level 0 */
     s2_l0_addr = qsmmu_get_table_addr(s2_vttb, 0, ipa);
-    qtest_writeq(qts, s2_l0_addr, all_s2_l0_pte_val);
+    qsmmu_writeq(qts, s2_l0_addr, all_s2_l0_pte_val, space);
 
     /* Stage 2 Level 1 */
     s2_l1_addr = qsmmu_get_table_addr(all_s2_l0_pte_val, 1, ipa);
-    qtest_writeq(qts, s2_l1_addr, all_s2_l1_pte_val);
+    qsmmu_writeq(qts, s2_l1_addr, all_s2_l1_pte_val, space);
 
     /* Stage 2 Level 2 */
     s2_l2_addr = qsmmu_get_table_addr(all_s2_l1_pte_val, 2, ipa);
-    qtest_writeq(qts, s2_l2_addr, all_s2_l2_pte_val);
+    qsmmu_writeq(qts, s2_l2_addr, all_s2_l2_pte_val, space);
 
     /* Stage 2 Level 3 (leaf) */
     s2_l3_addr = qsmmu_get_table_addr(all_s2_l2_pte_val, 3, ipa);
@@ -479,7 +546,7 @@ static void qsmmu_setup_s2_walk_for_ipa(QTestState *qts,
             qsmmu_get_pte_attrs(QSMMU_TM_S2_ONLY, true, space);
     }
 
-    qtest_writeq(qts, s2_l3_addr, all_s2_l3_pte_val);
+    qsmmu_writeq(qts, s2_l3_addr, all_s2_l3_pte_val, space);
 }
 
 /*
@@ -512,11 +579,12 @@ static void qsmmu_setup_s1_level_with_nested_s2(QTestState *qts,
      * - S2_ONLY: Needs S2 tables for direct translation
      * - NESTED: Needs S2 tables for nested translation
      */
+    // (void)s1_level;  /* Used for debugging if needed */
     qsmmu_setup_s2_walk_for_ipa(qts, space, s1_pte_addr,
                                 s2_vttb, mode, false);
 
-    /* Write the S1 PTE value */
-    qtest_writeq(qts, s1_pte_addr, s1_pte_val);
+    /* Write the S1 PTE value using space-aware wrapper */
+    qsmmu_writeq(qts, s1_pte_addr, s1_pte_val, space);
 }
 
 /*
@@ -524,8 +592,8 @@ static void qsmmu_setup_s1_level_with_nested_s2(QTestState *qts,
  *
  * The 'SEC_SID' represents the input security state of the device/transaction,
  * whether it's a static Secure state or a dynamically-switched Realm state.
- * SEC_SID has been converted to the corresponding Security Space (QSMMUSpace)
- * before calling this function.
+ * The caller provides transaction space directly and programs SEC_SID
+ * independently for iommu-testdev.
  *
  * In a real SMMU translation, this input security state does not unilaterally
  * determine the output Physical Address (PA) space. The output PA space is
