@@ -60,7 +60,9 @@ static void iommu_testdev_maybe_run_dma(IOMMUTestDevState *s)
     g_autofree uint8_t *read_buf = NULL;
     MemTxResult write_res, read_res;
     MemTxAttrs attrs = {};
+    IOMMUTLBEntry iotlb;
     AddressSpace *as;
+    AddressSpace *read_as;
     bool space_valid;
 
     if (!s->dma_armed) {
@@ -115,7 +117,17 @@ static void iommu_testdev_maybe_run_dma(IOMMUTestDevState *s)
     /* Step 2: Read back from the same DMA address */
     trace_iommu_testdev_dma_read(s->dma_vaddr, s->dma_len);
 
-    read_res = address_space_read(&address_space_memory, s->dma_paddr,
+    rcu_read_lock();
+    iotlb = address_space_get_iotlb_entry(as, s->dma_vaddr, false, attrs);
+    rcu_read_unlock();
+
+    if (!iotlb.target_as || !(iotlb.perm & IOMMU_RO)) {
+        s->dma_result = ITD_DMA_ERR_RD_FAIL;
+        goto out;
+    }
+
+    read_as = iotlb.target_as;
+    read_res = address_space_read(read_as, s->dma_paddr,
                                   attrs, read_buf, s->dma_len);
 
     if (read_res != MEMTX_OK) {
